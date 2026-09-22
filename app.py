@@ -1,0 +1,627 @@
+"""
+Análisis de Cartera — Seguros de Vida
+======================================
+
+Aplicación Streamlit para explorar de forma interactiva la cartera de seguros
+de vida analizada en `notebooks/eda_seguros.ipynb`. Reutiliza la misma lógica
+de limpieza de datos documentada allí y las decisiones de visualización del
+reporte `outputs/reporte_figuras.md` (qué figuras incluir, mejorar o
+descartar) más los hallazgos nuevos generados en ese reporte.
+
+Esta app NO copia los datos crudos: los lee directamente desde la carpeta
+`datos/` del proyecto (ver resolución de `DATA_DIR` más abajo).
+"""
+
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+# ---------------------------------------------------------------------------
+# Configuración de página
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Análisis de Cartera — Seguros de Vida",
+    page_icon="📊",
+    layout="wide",
+)
+
+# ---------------------------------------------------------------------------
+# Paleta de colores (consistente en toda la app)
+# ---------------------------------------------------------------------------
+# Paleta categórica validada para accesibilidad (contraste y daltonismo):
+# slot 1 = azul, slot 2 = naranja (acento). Se mantiene además la asociación
+# de género usada en el notebook original (M=azul, F=naranja).
+COLOR_PRIMARY = "#2a78d6"      # azul — color principal / serie 1
+COLOR_ACCENT = "#eb6834"       # naranja — acento / serie 2
+COLOR_MUTED = "#898781"        # gris — ejes, etiquetas secundarias
+COLOR_GRID = "#e1e0d9"         # gris claro — líneas de grilla
+COLOR_REFERENCE = "#9a9a94"    # gris — líneas de referencia/mediana global
+COLOR_TEXT_SECONDARY = "#52514e"
+
+GENDER_COLOR_MAP = {"M": COLOR_PRIMARY, "F": COLOR_ACCENT}
+
+# Rampa secuencial de azules (magnitud), de más clara a más oscura.
+BLUE_SEQUENTIAL = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
+
+PLOTLY_TEMPLATE = "plotly_white"
+
+CHART_FONT = dict(family="system-ui, -apple-system, Segoe UI, sans-serif", color="#0b0b0b")
+
+
+def style_fig(fig, height=420, showlegend=True):
+    """Aplica un estilo consistente (grilla tenue, fuente, márgenes) a cada figura."""
+    fig.update_layout(
+        template=PLOTLY_TEMPLATE,
+        font=CHART_FONT,
+        height=height,
+        showlegend=showlegend,
+        margin=dict(l=10, r=10, t=60, b=10),
+        plot_bgcolor="#fcfcfb",
+        paper_bgcolor="#fcfcfb",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    fig.update_xaxes(gridcolor=COLOR_GRID, zeroline=False, linecolor=COLOR_MUTED)
+    fig.update_yaxes(gridcolor=COLOR_GRID, zeroline=False, linecolor=COLOR_MUTED)
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Resolución de la carpeta de datos
+# ---------------------------------------------------------------------------
+# La app NO incluye datos propios: los busca en una carpeta `datos/` ubicada
+# junto al proyecto. Se contemplan dos layouts posibles y una variable de
+# entorno de override explícito, en ese orden de prioridad:
+#   1) SEGUROS_EDA_DATA_DIR      -> override explícito (variable de entorno)
+#   2) <raíz del proyecto>/seguros_eda_app/../seguros_eda/datos
+#      (estructura solicitada: seguros_eda_app y seguros_eda como carpetas
+#      hermanas dentro del home del usuario)
+#   3) <raíz del proyecto>/datos
+#      (esta app vive DENTRO de la carpeta del proyecto, junto a datos/,
+#      notebooks/ y outputs/ — es el layout usado para probar esta app)
+APP_DIR = Path(__file__).resolve().parent
+
+def _resolve_data_dir() -> Path:
+    env_override = os.environ.get("SEGUROS_EDA_DATA_DIR", "").strip()
+    candidates = []
+    if env_override:
+        candidates.append(Path(env_override))
+    candidates.append(APP_DIR.parent / "seguros_eda" / "datos")
+    candidates.append(APP_DIR.parent / "datos")
+
+    for c in candidates:
+        if (c / "Super_reducido_Prod1.xlsx").exists():
+            return c
+    # Si ninguna existe, devolvemos la más probable para que el mensaje de
+    # error en pantalla indique una ruta concreta y accionable.
+    return candidates[-1]
+
+
+DATA_DIR = _resolve_data_dir()
+DATA_FILE = DATA_DIR / "Super_reducido_Prod1.xlsx"
+
+# ---------------------------------------------------------------------------
+# Carga y limpieza de datos (misma lógica que notebooks/eda_seguros.ipynb,
+# Sección 1.4 — "Aplicamos las correcciones documentadas")
+# ---------------------------------------------------------------------------
+AGE_BINS = [0, 30, 40, 50, 60, 150]
+AGE_LABELS = ["<30", "30-40", "40-50", "50-60", "60+"]
+
+
+@st.cache_data(show_spinner="Cargando y limpiando la base de datos (puede tardar 1-3 minutos la primera vez)...")
+def load_clean_data(data_file: str) -> pd.DataFrame:
+    df = pd.read_excel(data_file, sheet_name="Hoja1")
+    d = df.copy()
+
+    # (1) y (2): recalcular Edad para los registros con "(nulo)"
+    mask_nulo = d["Edad"] == "(nulo)"
+    fecha_nac = pd.to_datetime(d["Cliente Asegurado[Fecha Nacimiento]"], errors="coerce")
+    edad_recalculada = (d.loc[mask_nulo, "occurDate"] - fecha_nac.loc[mask_nulo]).dt.days / 365.25
+    d.loc[mask_nulo, "Edad"] = edad_recalculada
+    d["Edad"] = pd.to_numeric(d["Edad"], errors="coerce")
+    d["Cliente Asegurado[Fecha Nacimiento]"] = fecha_nac
+
+    # Variable de estatus
+    d["Status"] = np.where(d["Siniestro"] == 1, "Fallecido", "No Fallecido")
+    d["is_siniestro"] = d["Siniestro"]
+
+    # (3) Remover Edad_ingreso > 100 (fechas de nacimiento centinela)
+    mask_edad_valida = d["Edad_ingreso"] <= 100
+    d = d[mask_edad_valida].copy()
+
+    # (4) Marcar (sin eliminar) montos negativos
+    d["suma_valida"] = d["Suma_asegurada"] >= 0
+
+    # Deciles etarios (se mantienen por compatibilidad, no se usan en la app)
+    d["age_decile"] = pd.qcut(d["Edad_ingreso"], 10, duplicates="drop")
+
+    # Rangos etarios "de negocio" (Sección 3 de la app)
+    d["rango_edad"] = pd.cut(d["Edad_ingreso"], bins=AGE_BINS, labels=AGE_LABELS, right=False)
+
+    # Segmento por cuartil de Suma Asegurada (Sección 2) — se calcula una
+    # única vez sobre TODA la base para que los cortes de cuartil no cambien
+    # con los filtros (comparabilidad entre selecciones).
+    d["segmento_suma"] = pd.Series(pd.NA, index=d.index, dtype="object")
+    valid_idx = d.index[d["suma_valida"]]
+    d.loc[valid_idx, "segmento_suma"] = pd.qcut(
+        d.loc[valid_idx, "Suma_UMS"], 4, labels=["Q1 (más bajo)", "Q2", "Q3", "Q4 (más alto)"]
+    ).astype(str)
+
+    return d
+
+
+def hist_binned(serie: pd.Series, bins: int = 60):
+    """Histograma pre-agregado con numpy (evita mandarle al navegador arrays
+    de cientos de miles de filas). Devuelve centros de bin y conteos."""
+    s = serie.dropna()
+    if s.empty:
+        return np.array([]), np.array([])
+    counts, edges = np.histogram(s, bins=bins)
+    centers = (edges[:-1] + edges[1:]) / 2
+    return centers, counts
+
+
+# ---------------------------------------------------------------------------
+# Filtros reutilizables
+# ---------------------------------------------------------------------------
+UNIDAD_COL = "Unidad de Negocio[Unidad Negocios]"
+
+
+def unidad_filter(d: pd.DataFrame, key: str):
+    unidades = sorted(d[UNIDAD_COL].dropna().unique().tolist())
+    seleccion = st.multiselect(
+        "Unidad de negocio", options=unidades, default=unidades, key=f"unidad_{key}"
+    )
+    return seleccion
+
+
+def genero_filter(key: str):
+    seleccion = st.multiselect(
+        "Género", options=["F", "M"], default=["F", "M"], key=f"genero_{key}"
+    )
+    return seleccion
+
+
+def sin_datos():
+    st.warning("No hay datos para la selección actual")
+
+
+# ---------------------------------------------------------------------------
+# Panel de KPIs (header, siempre visible)
+# ---------------------------------------------------------------------------
+def compute_kpis(d: pd.DataFrame) -> dict:
+    n_total = len(d)
+    n_siniestros = int(d["is_siniestro"].sum())
+    incidencia = n_siniestros / n_total * 100 if n_total else 0.0
+    monto_total_ums = d.loc[d["suma_valida"], "Suma_UMS"].sum()
+    unidad_counts = d[UNIDAD_COL].value_counts()
+    top3_pct = unidad_counts.head(3).sum() / unidad_counts.sum() * 100 if len(unidad_counts) else 0.0
+    demora_mediana = d["demora_den"].median()
+    return dict(
+        n_total=n_total,
+        incidencia=incidencia,
+        monto_total_ums=monto_total_ums,
+        top3_pct=top3_pct,
+        demora_mediana=demora_mediana,
+    )
+
+
+def render_kpi_header(d: pd.DataFrame):
+    st.title("Análisis de Cartera — Seguros de Vida")
+    kpis = compute_kpis(d)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total de asegurados", f"{kpis['n_total']:,.0f}".replace(",", "."))
+    c2.metric(
+        "Incidencia global", f"{kpis['incidencia']:.2f}%",
+        help="Incidencia de muerte global: siniestros sobre el total de asegurados de la cartera.",
+    )
+    c3.metric(
+        "Monto expuesto", f"{kpis['monto_total_ums']:,.0f} UMS".replace(",", "."),
+        help="Monto total expuesto en Suma Asegurada (UMS), sumando toda la cartera con signo válido.",
+    )
+    c4.metric(
+        "Top-3 unidades", f"{kpis['top3_pct']:.1f}%",
+        help="Concentración de cartera: % de asegurados en las 3 unidades de negocio más grandes.",
+    )
+    c5.metric(
+        "Demora de denuncia", f"{kpis['demora_mediana']:.0f} días",
+        help="Demora mediana de denuncia: días entre la ocurrencia del siniestro y su notificación.",
+    )
+
+    st.caption(
+        "El monto expuesto representa el capital máximo potencial, "
+        "no el costo esperado de siniestros."
+    )
+    st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Sección 1 — Composición de la cartera
+# ---------------------------------------------------------------------------
+def section_composicion(d: pd.DataFrame):
+    st.header("1. Composición de la cartera")
+
+    fcol1, fcol2 = st.columns(2)
+    with fcol1:
+        unidades_sel = unidad_filter(d, "s1")
+    with fcol2:
+        generos_sel = genero_filter("s1")
+
+    dd = d[d[UNIDAD_COL].isin(unidades_sel) & d["sexo"].isin(generos_sel)]
+    if dd.empty:
+        sin_datos()
+        return
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Distribución de edad de ingreso")
+        centers, counts = hist_binned(dd["Edad_ingreso"], bins=60)
+        fig = px.bar(x=centers, y=counts, labels={"x": "Edad de ingreso", "y": "Cantidad de asegurados"})
+        fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
+        style_fig(fig, showlegend=False)
+        st.plotly_chart(fig, width='stretch')
+        st.caption(
+            "Muestra en qué edades se concentra el ingreso a la cartera. "
+            "La mayoría de los asegurados ingresa entre los 30 y los 55 años."
+        )
+
+    with col2:
+        st.subheader("Composición por sexo")
+        sexo_counts = dd["sexo"].value_counts()
+        fig = px.pie(
+            values=sexo_counts.values, names=sexo_counts.index, hole=0.45,
+            color=sexo_counts.index, color_discrete_map=GENDER_COLOR_MAP,
+        )
+        style_fig(fig, height=420)
+        st.plotly_chart(fig, width='stretch')
+        st.caption("Proporción de hombres y mujeres en la selección actual de la cartera.")
+
+    st.subheader("Distribución de cartera por unidad de negocio")
+    orden = dd[UNIDAD_COL].value_counts().sort_values(ascending=True)
+    fig = px.bar(
+        x=orden.values, y=orden.index, orientation="h",
+        labels={"x": "Cantidad de asegurados", "y": ""},
+    )
+    fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
+    style_fig(fig, height=max(380, 28 * len(orden)), showlegend=False)
+    st.plotly_chart(fig, width='stretch')
+    st.caption(
+        "Tamaño relativo de cada unidad de negocio. La cartera está fuertemente "
+        "concentrada en pocas unidades (ver KPI de concentración top-3)."
+    )
+
+    st.subheader("Distribución de edad de ingreso por sexo")
+    fig = go.Figure()
+    for genero in ["M", "F"]:
+        sub = dd.loc[dd["sexo"] == genero, "Edad_ingreso"]
+        if sub.empty:
+            continue
+        centers, counts = hist_binned(sub, bins=60)
+        fig.add_trace(go.Bar(x=centers, y=counts, name=genero, marker_color=GENDER_COLOR_MAP[genero], opacity=0.75))
+    fig.update_layout(barmode="overlay")
+    style_fig(fig)
+    fig.update_xaxes(title="Edad de ingreso")
+    fig.update_yaxes(title="Cantidad de asegurados")
+    st.plotly_chart(fig, width='stretch')
+    st.caption("Compara la forma de la distribución etaria entre hombres y mujeres en la selección actual.")
+
+
+# ---------------------------------------------------------------------------
+# Sección 2 — Riesgo y siniestralidad
+# ---------------------------------------------------------------------------
+def section_riesgo(d: pd.DataFrame):
+    st.header("2. Riesgo y siniestralidad")
+
+    unidades_sel = unidad_filter(d, "s2")
+    dd = d[d[UNIDAD_COL].isin(unidades_sel)]
+    if dd.empty:
+        sin_datos()
+        return
+
+    incidencia_global = dd["is_siniestro"].sum() / len(dd) * 100
+
+    st.subheader("Incidencia de siniestros por unidad de negocio")
+    riesgo_unidad = dd.groupby(UNIDAD_COL, observed=True)["is_siniestro"].agg(["sum", "count"])
+    riesgo_unidad.columns = ["siniestros", "total_asegurados"]
+    riesgo_unidad["pct_siniestros"] = riesgo_unidad["siniestros"] / riesgo_unidad["total_asegurados"] * 100
+    riesgo_unidad = riesgo_unidad.sort_values("pct_siniestros", ascending=True)
+    fig = px.bar(
+        riesgo_unidad.reset_index(), x="pct_siniestros", y=UNIDAD_COL, orientation="h",
+        color="total_asegurados", color_continuous_scale=BLUE_SEQUENTIAL,
+        labels={"pct_siniestros": "% de siniestros", UNIDAD_COL: "", "total_asegurados": "Total asegurados"},
+    )
+    style_fig(fig, height=max(380, 28 * len(riesgo_unidad)), showlegend=False)
+    st.plotly_chart(fig, width='stretch')
+    st.caption(
+        "El volumen de siniestros y el riesgo relativo cuentan historias distintas: unidades chicas "
+        "pueden tener una proporción de siniestros mucho mayor que unidades grandes."
+    )
+
+    st.subheader("Exposición monetaria vs. siniestralidad por unidad de negocio")
+    exp_unidad = dd[dd["suma_valida"]].groupby(UNIDAD_COL, observed=True).agg(
+        n_polizas=("Refcert", "count"), monto_ums=("Suma_UMS", "sum"), siniestros=("is_siniestro", "sum")
+    )
+    if exp_unidad.empty:
+        st.info("No hay registros con Suma Asegurada válida en la selección actual.")
+    else:
+        exp_unidad["pct_siniestros"] = exp_unidad["siniestros"] / exp_unidad["n_polizas"] * 100
+        exp_unidad["pct_exposicion"] = exp_unidad["monto_ums"] / exp_unidad["monto_ums"].sum() * 100
+        fig = px.scatter(
+            exp_unidad.reset_index(), x="n_polizas", y="pct_siniestros",
+            size="pct_exposicion", color="pct_exposicion", color_continuous_scale=BLUE_SEQUENTIAL,
+            text=UNIDAD_COL, size_max=55, log_x=True,
+            labels={
+                "n_polizas": "N° de asegurados en la unidad (escala log)",
+                "pct_siniestros": "% de siniestros",
+                "pct_exposicion": "% de exposición monetaria",
+            },
+        )
+        fig.update_traces(textposition="top center", marker_line_color="#0b0b0b", marker_line_width=0.6)
+        fig.add_hline(y=incidencia_global, line_dash="dash", line_color=COLOR_REFERENCE,
+                      annotation_text=f"incidencia global ({incidencia_global:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
+        x_min = exp_unidad["n_polizas"].min()
+        x_max = exp_unidad["n_polizas"].max()
+        fig.update_xaxes(range=[np.log10(x_min) - 0.35, np.log10(x_max) + 0.55])
+        style_fig(fig, height=520, showlegend=False)
+        fig.update_layout(margin=dict(l=10, r=40, t=60, b=10))
+        st.plotly_chart(fig, width='stretch')
+        st.caption(
+            "El tamaño y color del punto indican qué porción del capital asegurado de la cartera "
+            "concentra cada unidad. Revela si el riesgo relativo coincide con la mayor exposición económica."
+        )
+
+    st.subheader("Incidencia de siniestros por segmento de Suma Asegurada")
+    seg = dd.dropna(subset=["segmento_suma"]).groupby("segmento_suma", observed=True).agg(
+        n_polizas=("Refcert", "count"), siniestros=("is_siniestro", "sum")
+    )
+    orden_seg = ["Q1 (más bajo)", "Q2", "Q3", "Q4 (más alto)"]
+    seg = seg.reindex([s for s in orden_seg if s in seg.index])
+    if seg.empty:
+        st.info("No hay registros con Suma Asegurada válida en la selección actual.")
+    else:
+        seg["pct_siniestros"] = seg["siniestros"] / seg["n_polizas"] * 100
+        fig = px.bar(seg.reset_index(), x="segmento_suma", y="pct_siniestros",
+                     labels={"segmento_suma": "Segmento por Suma Asegurada", "pct_siniestros": "% de siniestros"})
+        fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
+        fig.add_hline(y=incidencia_global, line_dash="dash", line_color=COLOR_REFERENCE,
+                      annotation_text=f"incidencia global ({incidencia_global:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
+        style_fig(fig, showlegend=False)
+        st.plotly_chart(fig, width='stretch')
+        st.caption(
+            "Los cuartiles se calculan una sola vez sobre toda la cartera (no cambian con los filtros) "
+            "para poder comparar entre selecciones. La relación entre cobertura y riesgo no es lineal."
+        )
+
+    st.subheader("Días hasta el siniestro")
+    siniestros_dd = dd[dd["is_siniestro"] == 1]
+    if siniestros_dd.empty:
+        sin_datos()
+    else:
+        mediana_dias = siniestros_dd["dias_hasta_sin"].median()
+        centers, counts = hist_binned(siniestros_dd["dias_hasta_sin"], bins=60)
+        fig = px.bar(x=centers, y=counts, labels={"x": "Días hasta el siniestro", "y": "Cantidad de siniestros"})
+        fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
+        fig.add_vline(x=mediana_dias, line_dash="dash", line_color=COLOR_REFERENCE,
+                      annotation_text=f"Mediana: {mediana_dias:.0f} días", annotation_font_color=COLOR_TEXT_SECONDARY)
+        style_fig(fig, showlegend=False)
+        st.plotly_chart(fig, width='stretch')
+        st.caption(
+            "Indica en qué etapa de la vida de la póliza ocurren los siniestros. La mayor concentración "
+            "sucede dentro de los primeros años de vigencia."
+        )
+
+    st.subheader("Suma asegurada por estatus (fallecido vs. no fallecido)")
+    d_valid = dd[dd["suma_valida"]]
+    if d_valid.empty:
+        sin_datos()
+    else:
+        fig = px.box(
+            d_valid, x="Status", y="Suma_UMS", color="Status",
+            category_orders={"Status": ["No Fallecido", "Fallecido"]},
+            color_discrete_map={"No Fallecido": COLOR_PRIMARY, "Fallecido": COLOR_ACCENT},
+            log_y=True,
+            labels={"Suma_UMS": "Suma Asegurada (UMS, escala log)", "Status": ""},
+        )
+        style_fig(fig, showlegend=False)
+        st.plotly_chart(fig, width='stretch')
+        st.caption(
+            "Se usa escala logarítmica porque la Suma Asegurada tiene valores extremos que aplastarían "
+            "la comparación en escala lineal. Permite ver si los siniestros ocurren en pólizas de mayor o menor cobertura."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sección 3 — Perfil etario y cobertura
+# ---------------------------------------------------------------------------
+def section_etario(d: pd.DataFrame):
+    st.header("3. Perfil etario y cobertura")
+
+    fcol1, fcol2 = st.columns(2)
+    with fcol1:
+        generos_sel = genero_filter("s3")
+    with fcol2:
+        unidades_sel = unidad_filter(d, "s3")
+
+    dd = d[d["sexo"].isin(generos_sel) & d[UNIDAD_COL].isin(unidades_sel)]
+    if dd.empty:
+        sin_datos()
+        return
+
+    incidencia_global = dd["is_siniestro"].sum() / len(dd) * 100
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Incidencia de siniestros por rango etario")
+        by_edad = dd.dropna(subset=["rango_edad"]).groupby("rango_edad", observed=True).agg(
+            n=("is_siniestro", "count"), eventos=("is_siniestro", "sum")
+        ).reindex(AGE_LABELS)
+        by_edad["incidencia"] = by_edad["eventos"] / by_edad["n"] * 100
+        fig = px.bar(by_edad.reset_index(), x="rango_edad", y="incidencia",
+                     labels={"rango_edad": "Rango etario (edad de ingreso)", "incidencia": "% de siniestros"})
+        fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
+        fig.add_hline(y=incidencia_global, line_dash="dash", line_color=COLOR_REFERENCE,
+                      annotation_text=f"incidencia global ({incidencia_global:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
+        style_fig(fig, showlegend=False)
+        st.plotly_chart(fig, width='stretch')
+        st.caption(
+            "El riesgo crece con la edad de ingreso, pero de forma no lineal: el salto más marcado "
+            "ocurre a partir de los 50 años."
+        )
+
+    with col2:
+        st.subheader("Suma asegurada promedio por rango etario")
+        d_valid = dd[dd["suma_valida"]].dropna(subset=["rango_edad"])
+        if d_valid.empty:
+            st.info("No hay registros con Suma Asegurada válida en la selección actual.")
+        else:
+            by_edad_suma = d_valid.groupby("rango_edad", observed=True)["Suma_UMS"].mean().reindex(AGE_LABELS)
+            fig = px.bar(x=by_edad_suma.index, y=by_edad_suma.values,
+                         labels={"x": "Rango etario (edad de ingreso)", "y": "Suma Asegurada promedio (UMS)"})
+            fig.update_traces(marker_color=COLOR_ACCENT, marker_line_width=0)
+            style_fig(fig, showlegend=False)
+            st.plotly_chart(fig, width='stretch')
+            st.caption(
+                "Muestra si los asegurados de distintas edades contratan, en promedio, coberturas de "
+                "distinto tamaño."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Sección 4 — Análisis temporal
+# ---------------------------------------------------------------------------
+def section_temporal(d: pd.DataFrame):
+    st.header("4. Análisis temporal de altas de póliza")
+
+    col = "Poliza/Certificado[Fecha Origen Certificado]"
+    fechas = pd.to_datetime(d[col])
+    pct_dia1 = (fechas.dt.day == 1).mean() * 100
+
+    monthly = fechas.dt.to_period("M").value_counts().sort_index()
+    monthly.index = monthly.index.to_timestamp()
+
+    top_fecha = fechas.value_counts().idxmax()
+    top_fecha_n = fechas.value_counts().max()
+    top_fecha_pct = top_fecha_n / len(fechas) * 100
+
+    fig = px.bar(x=monthly.index, y=monthly.values,
+                 labels={"x": "Mes de alta de póliza", "y": "Cantidad de altas (escala log)"}, log_y=True)
+    fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
+    style_fig(fig, showlegend=False)
+    st.plotly_chart(fig, width='stretch')
+
+    st.warning(
+        f"**No se observa una estacionalidad de negocio interpretable.** El {pct_dia1:.0f}% de los "
+        f"registros tiene como fecha de alta el día 1 de un mes, y una sola fecha "
+        f"(**{pd.Timestamp(top_fecha).strftime('%Y-%m-%d')}**) concentra el {top_fecha_pct:.1f}% de toda "
+        "la cartera. Este patrón es típico de **cargas masivas de datos** (migraciones de sistema, "
+        "incorporación de carteras completas) y no de altas comerciales día a día. "
+        "**Recomendación:** no usar esta variable para conclusiones de estacionalidad de ventas sin antes "
+        "depurarla junto con el área de sistemas/negocio para distinguir altas reales de cargas por lote."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sección 5 — Demora de denuncia
+# ---------------------------------------------------------------------------
+def section_demora(d: pd.DataFrame):
+    st.header("5. Demora de denuncia")
+
+    st.markdown(
+        "La **demora de denuncia** es la cantidad de días entre la ocurrencia del siniestro y el momento "
+        "en que se notifica a la aseguradora. Es relevante operativamente porque una denuncia tardía "
+        "retrasa la constitución de reservas, la gestión del caso y, en algunas líneas, puede afectar la "
+        "cobertura contractual."
+    )
+
+    unidades_sel = unidad_filter(d, "s5")
+    dd = d[d[UNIDAD_COL].isin(unidades_sel) & (d["is_siniestro"] == 1)]
+    if dd.empty:
+        sin_datos()
+        return
+
+    mediana_global = dd["demora_den"].median()
+
+    resumen = dd.groupby(UNIDAD_COL, observed=True)["demora_den"].agg(
+        mediana="median", p25=lambda s: s.quantile(0.25), p75=lambda s: s.quantile(0.75), n="count"
+    ).sort_values("mediana", ascending=False)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=resumen.index, y=resumen["mediana"],
+        marker_color=COLOR_PRIMARY,
+        error_y=dict(
+            type="data", symmetric=False,
+            array=resumen["p75"] - resumen["mediana"],
+            arrayminus=resumen["mediana"] - resumen["p25"],
+            color=COLOR_MUTED,
+        ),
+        name="Mediana de demora (días)",
+    ))
+    fig.add_hline(y=mediana_global, line_dash="dash", line_color=COLOR_REFERENCE,
+                  annotation_text=f"mediana general ({mediana_global:.0f} días)", annotation_font_color=COLOR_TEXT_SECONDARY)
+    fig.update_layout(xaxis_title="", yaxis_title="Demora de denuncia (días)")
+    style_fig(fig, height=460, showlegend=False)
+    st.plotly_chart(fig, width='stretch')
+    st.caption(
+        "Barras ordenadas de mayor a menor demora mediana; las líneas verticales muestran el rango "
+        "intercuartílico (P25–P75) de cada unidad. La línea punteada es la mediana general de la selección."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    if not DATA_FILE.exists():
+        st.title("Análisis de Cartera — Seguros de Vida")
+        st.error(
+            "No se encontró el archivo de datos.\n\n"
+            f"Se buscó en: `{DATA_FILE}`\n\n"
+            "Verificá que la carpeta `datos/` del proyecto (con `Super_reducido_Prod1.xlsx`) esté "
+            "ubicada junto a esta app, o definí la variable de entorno `SEGUROS_EDA_DATA_DIR` "
+            "apuntando a esa carpeta. Ver README.md para más detalle."
+        )
+        st.stop()
+
+    d = load_clean_data(str(DATA_FILE))
+
+    render_kpi_header(d)
+
+    st.sidebar.title("Navegación")
+    seccion = st.sidebar.radio(
+        "Ir a la sección:",
+        [
+            "1. Composición de la cartera",
+            "2. Riesgo y siniestralidad",
+            "3. Perfil etario y cobertura",
+            "4. Análisis temporal",
+            "5. Demora de denuncia",
+        ],
+    )
+    st.sidebar.divider()
+    st.sidebar.caption(
+        "Datos leídos desde:\n\n"
+        f"`{DATA_DIR}`"
+    )
+
+    if seccion.startswith("1."):
+        section_composicion(d)
+    elif seccion.startswith("2."):
+        section_riesgo(d)
+    elif seccion.startswith("3."):
+        section_etario(d)
+    elif seccion.startswith("4."):
+        section_temporal(d)
+    elif seccion.startswith("5."):
+        section_demora(d)
+
+
+if __name__ == "__main__":
+    main()
