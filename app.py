@@ -12,6 +12,7 @@ Esta app NO copia los datos crudos: los lee directamente desde la carpeta
 `datos/` del proyecto (ver resolución de `DATA_DIR` más abajo).
 """
 
+import io
 import os
 from pathlib import Path
 
@@ -38,35 +39,37 @@ st.set_page_config(
 # de género usada en el notebook original (M=azul, F=naranja).
 COLOR_PRIMARY = "#2a78d6"      # azul — color principal / serie 1
 COLOR_ACCENT = "#eb6834"       # naranja — acento / serie 2
-COLOR_MUTED = "#898781"        # gris — ejes, etiquetas secundarias
-COLOR_GRID = "#e1e0d9"         # gris claro — líneas de grilla
-COLOR_REFERENCE = "#9a9a94"    # gris — líneas de referencia/mediana global
-COLOR_TEXT_SECONDARY = "#52514e"
+COLOR_MUTED = "#9a9a94"        # gris claro — ejes, etiquetas secundarias (visible sobre fondo oscuro)
+COLOR_GRID = "#3a3a38"         # gris oscuro — líneas de grilla sobre fondo oscuro
+COLOR_REFERENCE = "#c3c2b7"    # gris claro — líneas de referencia/mediana global
+COLOR_TEXT_SECONDARY = "#e8e7e2"  # texto secundario claro (anotaciones sobre fondo oscuro)
+COLOR_BG = "#1a1a19"           # fondo oscuro de los gráficos
 
 GENDER_COLOR_MAP = {"M": COLOR_PRIMARY, "F": COLOR_ACCENT}
 
 # Rampa secuencial de azules (magnitud), de más clara a más oscura.
 BLUE_SEQUENTIAL = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
 
-PLOTLY_TEMPLATE = "plotly_white"
+# Tema visual: fondo oscuro en todos los gráficos plotly, con texto blanco explícito.
+PLOTLY_TEMPLATE = "plotly_dark"
 
-CHART_FONT = dict(family="system-ui, -apple-system, Segoe UI, sans-serif", color="#0b0b0b")
+CHART_FONT = dict(family="system-ui, -apple-system, Segoe UI, sans-serif", color="white")
 
 
 def style_fig(fig, height=420, showlegend=True):
-    """Aplica un estilo consistente (grilla tenue, fuente, márgenes) a cada figura."""
+    """Aplica un estilo oscuro consistente (fondo oscuro, texto blanco, grilla tenue) a cada figura."""
     fig.update_layout(
         template=PLOTLY_TEMPLATE,
-        font=CHART_FONT,
+        font=dict(family="system-ui, -apple-system, Segoe UI, sans-serif", color="white"),
         height=height,
         showlegend=showlegend,
         margin=dict(l=10, r=10, t=60, b=10),
-        plot_bgcolor="#fcfcfb",
-        paper_bgcolor="#fcfcfb",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        plot_bgcolor=COLOR_BG,
+        paper_bgcolor=COLOR_BG,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(color="white")),
     )
-    fig.update_xaxes(gridcolor=COLOR_GRID, zeroline=False, linecolor=COLOR_MUTED)
-    fig.update_yaxes(gridcolor=COLOR_GRID, zeroline=False, linecolor=COLOR_MUTED)
+    fig.update_xaxes(gridcolor=COLOR_GRID, zeroline=False, linecolor=COLOR_MUTED, color="white")
+    fig.update_yaxes(gridcolor=COLOR_GRID, zeroline=False, linecolor=COLOR_MUTED, color="white")
     return fig
 
 
@@ -152,6 +155,96 @@ def load_clean_data(data_file: str) -> pd.DataFrame:
     ).astype(str)
 
     return d
+
+
+# ---------------------------------------------------------------------------
+# Carga alternativa vía uploader manual (fallback cuando no existe DATA_FILE)
+# ---------------------------------------------------------------------------
+# Columnas crudas esperadas de la base de siniestros de vida (mismo esquema
+# que `Super_reducido_Prod1.xlsx`, hoja "Hoja1").
+EXPECTED_COLUMNS = [
+    "Cliente Asegurado[Fecha Nacimiento]",
+    "Edad_ingreso",
+    "Poliza/Certificado[Fecha Origen Certificado]",
+    "Intermediario[Codigo Organizador - Organizador]",
+    "Unidad de Negocio[Unidad Negocios]",
+    "Refcert",
+    "Suma_asegurada",
+    "Suma_UMS",
+    "Siniestro",
+    "InicioVigencia",
+    "occurDate",
+    "dias_hasta_sin",
+    "lossNoticeDate",
+    "demora_den",
+    "Edad",
+    "sexo",
+]
+
+
+def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Misma lógica de limpieza que `load_clean_data` (ver esa función para el
+    detalle de cada paso), duplicada acá para poder aplicarla también sobre un
+    archivo cargado manualmente por el usuario sin tocar `load_clean_data`."""
+    d = df.copy()
+
+    mask_nulo = d["Edad"] == "(nulo)"
+    fecha_nac = pd.to_datetime(d["Cliente Asegurado[Fecha Nacimiento]"], errors="coerce")
+    edad_recalculada = (d.loc[mask_nulo, "occurDate"] - fecha_nac.loc[mask_nulo]).dt.days / 365.25
+    d.loc[mask_nulo, "Edad"] = edad_recalculada
+    d["Edad"] = pd.to_numeric(d["Edad"], errors="coerce")
+    d["Cliente Asegurado[Fecha Nacimiento]"] = fecha_nac
+
+    d["Status"] = np.where(d["Siniestro"] == 1, "Fallecido", "No Fallecido")
+    d["is_siniestro"] = d["Siniestro"]
+
+    mask_edad_valida = d["Edad_ingreso"] <= 100
+    d = d[mask_edad_valida].copy()
+
+    d["suma_valida"] = d["Suma_asegurada"] >= 0
+
+    d["age_decile"] = pd.qcut(d["Edad_ingreso"], 10, duplicates="drop")
+    d["rango_edad"] = pd.cut(d["Edad_ingreso"], bins=AGE_BINS, labels=AGE_LABELS, right=False)
+
+    d["segmento_suma"] = pd.Series(pd.NA, index=d.index, dtype="object")
+    valid_idx = d.index[d["suma_valida"]]
+    d.loc[valid_idx, "segmento_suma"] = pd.qcut(
+        d.loc[valid_idx, "Suma_UMS"], 4, labels=["Q1 (más bajo)", "Q2", "Q3", "Q4 (más alto)"]
+    ).astype(str)
+
+    return d
+
+
+@st.cache_data(show_spinner="Procesando el archivo cargado...")
+def process_uploaded_file(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    """Lee y limpia un archivo subido manualmente (.csv o .xlsx).
+
+    Cachea por contenido del archivo (`file_bytes` como parte de la clave de
+    cache) para no reprocesar si el usuario no cambió el archivo. Lanza
+    `ValueError` si al archivo le faltan columnas esperadas del esquema
+    original de la base de siniestros de vida.
+    """
+    if file_name.lower().endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(file_bytes))
+    else:
+        try:
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Hoja1")
+        except ValueError:
+            df = pd.read_excel(io.BytesIO(file_bytes))
+
+    faltantes = [c for c in EXPECTED_COLUMNS if c not in df.columns]
+    if faltantes:
+        raise ValueError(
+            "El archivo no tiene las columnas esperadas de la base de siniestros de vida. "
+            "Faltan las siguientes columnas: " + ", ".join(faltantes)
+        )
+
+    # `_clean_dataframe` opera sobre `occurDate` como fecha (necesita restar
+    # fechas para recalcular la edad de los registros "(nulo)"). Un CSV no
+    # tiene tipos de columna propios como un .xlsx, así que lo normalizamos acá.
+    df["occurDate"] = pd.to_datetime(df["occurDate"], errors="coerce")
+
+    return _clean_dataframe(df)
 
 
 def hist_binned(serie: pd.Series, bins: int = 60):
@@ -261,29 +354,32 @@ def section_composicion(d: pd.DataFrame):
 
     with col1:
         st.subheader("Distribución de edad de ingreso")
-        centers, counts = hist_binned(dd["Edad_ingreso"], bins=60)
-        fig = px.bar(x=centers, y=counts, labels={"x": "Edad de ingreso", "y": "Cantidad de asegurados"})
-        fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=dd["Edad_ingreso"], xbins=dict(size=5), marker_color=COLOR_PRIMARY))
         style_fig(fig, showlegend=False)
+        fig.update_xaxes(title="Edad de ingreso")
+        fig.update_yaxes(title="Cantidad de asegurados")
         st.plotly_chart(fig, width='stretch')
         st.caption(
-            "Muestra en qué edades se concentra el ingreso a la cartera. "
+            "Muestra en qué edades se concentra el ingreso a la cartera (bins de 5 años). "
             "La mayoría de los asegurados ingresa entre los 30 y los 55 años."
         )
 
     with col2:
         st.subheader("Composición por sexo")
-        sexo_counts = dd["sexo"].value_counts()
+        st.caption("Vista global de la cartera — no se ve afectada por los filtros")
+        sexo_counts = d["sexo"].value_counts()
         fig = px.pie(
             values=sexo_counts.values, names=sexo_counts.index, hole=0.45,
             color=sexo_counts.index, color_discrete_map=GENDER_COLOR_MAP,
         )
         style_fig(fig, height=420)
         st.plotly_chart(fig, width='stretch')
-        st.caption("Proporción de hombres y mujeres en la selección actual de la cartera.")
+        st.caption("Proporción de hombres y mujeres en el total de la cartera.")
 
     st.subheader("Distribución de cartera por unidad de negocio")
-    orden = dd[UNIDAD_COL].value_counts().sort_values(ascending=True)
+    st.caption("Vista global de la cartera — no se ve afectada por los filtros")
+    orden = d[UNIDAD_COL].value_counts().sort_values(ascending=True)
     fig = px.bar(
         x=orden.values, y=orden.index, orientation="h",
         labels={"x": "Cantidad de asegurados", "y": ""},
@@ -302,14 +398,14 @@ def section_composicion(d: pd.DataFrame):
         sub = dd.loc[dd["sexo"] == genero, "Edad_ingreso"]
         if sub.empty:
             continue
-        centers, counts = hist_binned(sub, bins=60)
-        fig.add_trace(go.Bar(x=centers, y=counts, name=genero, marker_color=GENDER_COLOR_MAP[genero], opacity=0.75))
+        fig.add_trace(go.Histogram(x=sub, xbins=dict(size=5), name=genero, marker_color=GENDER_COLOR_MAP[genero], opacity=0.75))
     fig.update_layout(barmode="overlay")
     style_fig(fig)
     fig.update_xaxes(title="Edad de ingreso")
     fig.update_yaxes(title="Cantidad de asegurados")
     st.plotly_chart(fig, width='stretch')
-    st.caption("Compara la forma de la distribución etaria entre hombres y mujeres en la selección actual.")
+    st.caption("Compara la forma de la distribución etaria entre hombres y mujeres en la selección actual (bins de 5 años).")
+    st.caption("La distribución etaria es similar entre hombres y mujeres, sin diferencias relevantes entre géneros.")
 
 
 # ---------------------------------------------------------------------------
@@ -324,10 +420,12 @@ def section_riesgo(d: pd.DataFrame):
         sin_datos()
         return
 
-    incidencia_global = dd["is_siniestro"].sum() / len(dd) * 100
+    incidencia_global_filtrada = dd["is_siniestro"].sum() / len(dd) * 100
+    incidencia_global_total = d["is_siniestro"].sum() / len(d) * 100
 
     st.subheader("Incidencia de siniestros por unidad de negocio")
-    riesgo_unidad = dd.groupby(UNIDAD_COL, observed=True)["is_siniestro"].agg(["sum", "count"])
+    st.caption("Vista de cartera total — no se ve afectada por los filtros")
+    riesgo_unidad = d.groupby(UNIDAD_COL, observed=True)["is_siniestro"].agg(["sum", "count"])
     riesgo_unidad.columns = ["siniestros", "total_asegurados"]
     riesgo_unidad["pct_siniestros"] = riesgo_unidad["siniestros"] / riesgo_unidad["total_asegurados"] * 100
     riesgo_unidad = riesgo_unidad.sort_values("pct_siniestros", ascending=True)
@@ -336,6 +434,9 @@ def section_riesgo(d: pd.DataFrame):
         color="total_asegurados", color_continuous_scale=BLUE_SEQUENTIAL,
         labels={"pct_siniestros": "% de siniestros", UNIDAD_COL: "", "total_asegurados": "Total asegurados"},
     )
+    fig.add_vline(x=incidencia_global_total, line_dash="dash", line_color=COLOR_REFERENCE,
+                  annotation_text=f"Incidencia global ({incidencia_global_total:.2f}%)",
+                  annotation_font_color=COLOR_TEXT_SECONDARY, annotation_position="bottom")
     style_fig(fig, height=max(380, 28 * len(riesgo_unidad)), showlegend=False)
     st.plotly_chart(fig, width='stretch')
     st.caption(
@@ -343,37 +444,44 @@ def section_riesgo(d: pd.DataFrame):
         "pueden tener una proporción de siniestros mucho mayor que unidades grandes."
     )
 
-    st.subheader("Exposición monetaria vs. siniestralidad por unidad de negocio")
-    exp_unidad = dd[dd["suma_valida"]].groupby(UNIDAD_COL, observed=True).agg(
-        n_polizas=("Refcert", "count"), monto_ums=("Suma_UMS", "sum"), siniestros=("is_siniestro", "sum")
+    st.subheader("Exposición, siniestralidad y demora de denuncia por unidad")
+    st.caption("Vista de cartera total — no se ve afectada por los filtros")
+    base_unidad = d.groupby(UNIDAD_COL, observed=True).agg(
+        n_polizas=("Refcert", "count"), siniestros=("is_siniestro", "sum")
     )
-    if exp_unidad.empty:
-        st.info("No hay registros con Suma Asegurada válida en la selección actual.")
+    demora_mediana_unidad = d[d["is_siniestro"] == 1].groupby(UNIDAD_COL, observed=True)["demora_den"].median()
+    monto_total_unidad = d[d["suma_valida"]].groupby(UNIDAD_COL, observed=True)["Suma_UMS"].sum()
+    base_unidad["demora_mediana"] = demora_mediana_unidad
+    base_unidad["monto_total_ums"] = monto_total_unidad
+    base_unidad["pct_siniestros"] = base_unidad["siniestros"] / base_unidad["n_polizas"] * 100
+    base_unidad = base_unidad.dropna(subset=["demora_mediana", "monto_total_ums"])
+    if base_unidad.empty:
+        st.info("No hay datos suficientes de demora de denuncia por unidad.")
     else:
-        exp_unidad["pct_siniestros"] = exp_unidad["siniestros"] / exp_unidad["n_polizas"] * 100
-        exp_unidad["pct_exposicion"] = exp_unidad["monto_ums"] / exp_unidad["monto_ums"].sum() * 100
         fig = px.scatter(
-            exp_unidad.reset_index(), x="n_polizas", y="pct_siniestros",
-            size="pct_exposicion", color="pct_exposicion", color_continuous_scale=BLUE_SEQUENTIAL,
+            base_unidad.reset_index(), x="n_polizas", y="pct_siniestros",
+            size="demora_mediana", color="monto_total_ums", color_continuous_scale=BLUE_SEQUENTIAL,
             text=UNIDAD_COL, size_max=55, log_x=True,
             labels={
                 "n_polizas": "N° de asegurados en la unidad (escala log)",
                 "pct_siniestros": "% de siniestros",
-                "pct_exposicion": "% de exposición monetaria",
+                "demora_mediana": "Demora mediana de denuncia (días)",
+                "monto_total_ums": "Monto total asegurado (UMS)",
             },
         )
-        fig.update_traces(textposition="top center", marker_line_color="#0b0b0b", marker_line_width=0.6)
-        fig.add_hline(y=incidencia_global, line_dash="dash", line_color=COLOR_REFERENCE,
-                      annotation_text=f"incidencia global ({incidencia_global:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
-        x_min = exp_unidad["n_polizas"].min()
-        x_max = exp_unidad["n_polizas"].max()
+        fig.update_traces(textposition="top center", marker_line_color="white", marker_line_width=0.6)
+        fig.add_hline(y=incidencia_global_total, line_dash="dash", line_color=COLOR_REFERENCE,
+                      annotation_text=f"incidencia global ({incidencia_global_total:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
+        x_min = base_unidad["n_polizas"].min()
+        x_max = base_unidad["n_polizas"].max()
         fig.update_xaxes(range=[np.log10(x_min) - 0.35, np.log10(x_max) + 0.55])
         style_fig(fig, height=520, showlegend=False)
         fig.update_layout(margin=dict(l=10, r=40, t=60, b=10))
         st.plotly_chart(fig, width='stretch')
         st.caption(
-            "El tamaño y color del punto indican qué porción del capital asegurado de la cartera "
-            "concentra cada unidad. Revela si el riesgo relativo coincide con la mayor exposición económica."
+            "Cada burbuja es una unidad de negocio. Su posición muestra cuántos clientes tiene y qué "
+            "proporción siniestró. El color indica el capital total expuesto y el tamaño la demora "
+            "mediana de denuncia (a mayor burbuja, más días tarda la unidad en reportar un siniestro)."
         )
 
     st.subheader("Incidencia de siniestros por segmento de Suma Asegurada")
@@ -386,16 +494,37 @@ def section_riesgo(d: pd.DataFrame):
         st.info("No hay registros con Suma Asegurada válida en la selección actual.")
     else:
         seg["pct_siniestros"] = seg["siniestros"] / seg["n_polizas"] * 100
-        fig = px.bar(seg.reset_index(), x="segmento_suma", y="pct_siniestros",
+
+        # Límites reales de cada cuartil (min/max de Suma_UMS por grupo), calculados
+        # sobre toda la cartera para que las etiquetas no cambien con los filtros.
+        def _fmt_ums(v):
+            return f"{v:.1f}" if abs(v) < 10 else f"{v:,.0f}".replace(",", ".")
+
+        bounds = d.dropna(subset=["segmento_suma"]).groupby("segmento_suma", observed=True)["Suma_UMS"].agg(["min", "max"])
+        bounds = bounds.reindex(orden_seg)
+        q1_max = bounds.loc["Q1 (más bajo)", "max"]
+        q2_max = bounds.loc["Q2", "max"]
+        q3_max = bounds.loc["Q3", "max"]
+        etiquetas = {
+            "Q1 (más bajo)": f"Q1 (0 – {_fmt_ums(q1_max)} UMS)",
+            "Q2": f"Q2 ({_fmt_ums(q1_max)} – {_fmt_ums(q2_max)} UMS)",
+            "Q3": f"Q3 ({_fmt_ums(q2_max)} – {_fmt_ums(q3_max)} UMS)",
+            "Q4 (más alto)": f"Q4 ({_fmt_ums(q3_max)}+ UMS)",
+        }
+        seg = seg.reset_index()
+        seg["segmento_suma"] = seg["segmento_suma"].map(etiquetas)
+
+        fig = px.bar(seg, x="segmento_suma", y="pct_siniestros",
                      labels={"segmento_suma": "Segmento por Suma Asegurada", "pct_siniestros": "% de siniestros"})
         fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
-        fig.add_hline(y=incidencia_global, line_dash="dash", line_color=COLOR_REFERENCE,
-                      annotation_text=f"incidencia global ({incidencia_global:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
+        fig.add_hline(y=incidencia_global_filtrada, line_dash="dash", line_color=COLOR_REFERENCE,
+                      annotation_text=f"incidencia de la selección ({incidencia_global_filtrada:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
         style_fig(fig, showlegend=False)
         st.plotly_chart(fig, width='stretch')
         st.caption(
-            "Los cuartiles se calculan una sola vez sobre toda la cartera (no cambian con los filtros) "
-            "para poder comparar entre selecciones. La relación entre cobertura y riesgo no es lineal."
+            "La suma asegurada se divide en cuatro grupos de igual tamaño (cuartiles). Q1 agrupa las "
+            "pólizas de menor cobertura y Q4 las de mayor cobertura. Se muestra qué proporción de "
+            "asegurados siniestró en cada grupo."
         )
 
     st.subheader("Días hasta el siniestro")
@@ -435,6 +564,19 @@ def section_riesgo(d: pd.DataFrame):
             "la comparación en escala lineal. Permite ver si los siniestros ocurren en pólizas de mayor o menor cobertura."
         )
 
+    st.subheader("Edad de ingreso por estatus (fallecido vs. no fallecido)")
+    fig = px.box(
+        dd, x="Status", y="Edad_ingreso", color="Status",
+        category_orders={"Status": ["No Fallecido", "Fallecido"]},
+        color_discrete_map={"No Fallecido": COLOR_PRIMARY, "Fallecido": COLOR_ACCENT},
+        labels={"Edad_ingreso": "Edad de ingreso", "Status": ""},
+    )
+    style_fig(fig, showlegend=False)
+    st.plotly_chart(fig, width='stretch')
+    st.caption(
+        "Los asegurados que siniestran ingresaron a edades significativamente mayores que quienes no siniestran."
+    )
+
 
 # ---------------------------------------------------------------------------
 # Sección 3 — Perfil etario y cobertura
@@ -453,7 +595,8 @@ def section_etario(d: pd.DataFrame):
         sin_datos()
         return
 
-    incidencia_global = dd["is_siniestro"].sum() / len(dd) * 100
+    incidencia_seleccion = dd["is_siniestro"].sum() / len(dd) * 100
+    incidencia_global_total = d["is_siniestro"].sum() / len(d) * 100
 
     col1, col2 = st.columns(2)
 
@@ -466,13 +609,18 @@ def section_etario(d: pd.DataFrame):
         fig = px.bar(by_edad.reset_index(), x="rango_edad", y="incidencia",
                      labels={"rango_edad": "Rango etario (edad de ingreso)", "incidencia": "% de siniestros"})
         fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
-        fig.add_hline(y=incidencia_global, line_dash="dash", line_color=COLOR_REFERENCE,
-                      annotation_text=f"incidencia global ({incidencia_global:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
+        fig.add_hline(y=incidencia_seleccion, line_dash="dash", line_color=COLOR_REFERENCE,
+                      annotation_text=f"Incidencia de la selección ({incidencia_seleccion:.2f}%)",
+                      annotation_font_color=COLOR_TEXT_SECONDARY, annotation_position="top left")
+        fig.add_hline(y=incidencia_global_total, line_dash="dot", line_color=COLOR_ACCENT,
+                      annotation_text=f"Incidencia global (cartera completa) ({incidencia_global_total:.2f}%)",
+                      annotation_font_color=COLOR_TEXT_SECONDARY, annotation_position="bottom left")
         style_fig(fig, showlegend=False)
         st.plotly_chart(fig, width='stretch')
         st.caption(
             "El riesgo crece con la edad de ingreso, pero de forma no lineal: el salto más marcado "
-            "ocurre a partir de los 50 años."
+            "ocurre a partir de los 50 años. La línea punteada muestra la incidencia de la selección actual; "
+            "la línea de puntos, la incidencia global fija de toda la cartera."
         )
 
     with col2:
@@ -578,22 +726,7 @@ def section_demora(d: pd.DataFrame):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
-    if not DATA_FILE.exists():
-        st.title("Análisis de Cartera — Seguros de Vida")
-        st.error(
-            "No se encontró el archivo de datos.\n\n"
-            f"Se buscó en: `{DATA_FILE}`\n\n"
-            "Verificá que la carpeta `datos/` del proyecto (con `Super_reducido_Prod1.xlsx`) esté "
-            "ubicada junto a esta app, o definí la variable de entorno `SEGUROS_EDA_DATA_DIR` "
-            "apuntando a esa carpeta. Ver README.md para más detalle."
-        )
-        st.stop()
-
-    d = load_clean_data(str(DATA_FILE))
-
-    render_kpi_header(d)
-
+def _render_navegacion(d: pd.DataFrame, fuente_caption: str):
     st.sidebar.title("Navegación")
     seccion = st.sidebar.radio(
         "Ir a la sección:",
@@ -606,10 +739,7 @@ def main():
         ],
     )
     st.sidebar.divider()
-    st.sidebar.caption(
-        "Datos leídos desde:\n\n"
-        f"`{DATA_DIR}`"
-    )
+    st.sidebar.caption(fuente_caption)
 
     if seccion.startswith("1."):
         section_composicion(d)
@@ -621,6 +751,38 @@ def main():
         section_temporal(d)
     elif seccion.startswith("5."):
         section_demora(d)
+
+
+def main():
+    # 1) Intentar cargar automáticamente desde el path local ya definido.
+    if DATA_FILE.exists():
+        d = load_clean_data(str(DATA_FILE))
+        render_kpi_header(d)
+        _render_navegacion(d, "Datos leídos desde:\n\n" f"`{DATA_DIR}`")
+        return
+
+    # 2) El archivo no existe en el path local -> pantalla de carga manual,
+    # mostrando únicamente el uploader (sin contenido del dashboard).
+    st.title("Análisis de Cartera — Seguros de Vida")
+    _, col_centro, _ = st.columns([1, 2, 1])
+    with col_centro:
+        st.markdown("### Cargá el archivo de datos para iniciar el dashboard")
+        archivo = st.file_uploader("Archivo de datos", type=["csv", "xlsx"])
+        st.caption("El archivo debe contener las columnas originales de la base de siniestros de vida")
+
+    if archivo is None:
+        st.stop()
+
+    try:
+        d = process_uploaded_file(archivo.getvalue(), archivo.name)
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
+
+    st.success(f"Se cargaron {len(d):,} registros.".replace(",", "."))
+
+    render_kpi_header(d)
+    _render_navegacion(d, "Datos cargados manualmente:\n\n" f"`{archivo.name}`")
 
 
 if __name__ == "__main__":
