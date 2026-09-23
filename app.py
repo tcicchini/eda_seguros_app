@@ -97,7 +97,7 @@ def _resolve_data_dir() -> Path:
     candidates.append(APP_DIR.parent / "datos")
 
     for c in candidates:
-        if (c / "Super_reducido_Prod1.xlsx").exists():
+        if (c / "Super_reducido_Prod1.parquet").exists() or (c / "Super_reducido_Prod1.xlsx").exists():
             return c
     # Si ninguna existe, devolvemos la más probable para que el mensaje de
     # error en pantalla indique una ruta concreta y accionable.
@@ -105,7 +105,10 @@ def _resolve_data_dir() -> Path:
 
 
 DATA_DIR = _resolve_data_dir()
-DATA_FILE = DATA_DIR / "Super_reducido_Prod1.xlsx"
+# Preferimos el Parquet (carga mucho más rápida); si no existe, caemos al
+# Excel original como fallback.
+_DATA_FILE_PARQUET = DATA_DIR / "Super_reducido_Prod1.parquet"
+DATA_FILE = _DATA_FILE_PARQUET if _DATA_FILE_PARQUET.exists() else DATA_DIR / "Super_reducido_Prod1.xlsx"
 
 # ---------------------------------------------------------------------------
 # Carga y limpieza de datos (misma lógica que notebooks/eda_seguros.ipynb,
@@ -117,7 +120,17 @@ AGE_LABELS = ["<30", "30-40", "40-50", "50-60", "60+"]
 
 @st.cache_data(show_spinner="Cargando y limpiando la base de datos (puede tardar 1-3 minutos la primera vez)...")
 def load_clean_data(data_file: str) -> pd.DataFrame:
-    df = pd.read_excel(data_file, sheet_name="Hoja1")
+    if str(data_file).endswith(".parquet"):
+        df = pd.read_parquet(data_file)
+        # pandas 3 infiere las columnas de texto leídas de un Parquet con su
+        # dtype "str" (arrow), más estricto que el "object" que devuelve
+        # read_excel: no acepta que más abajo se le asignen valores float
+        # (edad recalculada) a esta columna. Lo restauramos a "object" para
+        # que el resto de la función se comporte igual con ambos formatos.
+        df["Edad"] = df["Edad"].astype(object)
+        df["Cliente Asegurado[Fecha Nacimiento]"] = df["Cliente Asegurado[Fecha Nacimiento]"].astype(object)
+    else:
+        df = pd.read_excel(data_file, sheet_name="Hoja1")
     d = df.copy()
 
     # (1) y (2): recalcular Edad para los registros con "(nulo)"
@@ -139,19 +152,25 @@ def load_clean_data(data_file: str) -> pd.DataFrame:
     # (4) Marcar (sin eliminar) montos negativos
     d["suma_valida"] = d["Suma_asegurada"] >= 0
 
+    # Monto en dólares (reemplaza a Suma_UMS y Suma_asegurada en toda la UI).
+    # 1 UMS = 228.700 ARS; 1 USD = 1.500 ARS. Se calcula acá (y no se elimina
+    # Suma_UMS/Suma_asegurada) porque el segmento por cuartil, más abajo, ya
+    # se calcula sobre este monto en dólares.
+    d["suma_usd"] = d["Suma_UMS"] * 228700 / 1500
+
     # Deciles etarios (se mantienen por compatibilidad, no se usan en la app)
     d["age_decile"] = pd.qcut(d["Edad_ingreso"], 10, duplicates="drop")
 
     # Rangos etarios "de negocio" (Sección 3 de la app)
     d["rango_edad"] = pd.cut(d["Edad_ingreso"], bins=AGE_BINS, labels=AGE_LABELS, right=False)
 
-    # Segmento por cuartil de Suma Asegurada (Sección 2) — se calcula una
-    # única vez sobre TODA la base para que los cortes de cuartil no cambien
-    # con los filtros (comparabilidad entre selecciones).
+    # Segmento por cuartil de Suma Asegurada, en USD (Sección 2) — se calcula
+    # una única vez sobre TODA la base para que los cortes de cuartil no
+    # cambien con los filtros (comparabilidad entre selecciones).
     d["segmento_suma"] = pd.Series(pd.NA, index=d.index, dtype="object")
     valid_idx = d.index[d["suma_valida"]]
     d.loc[valid_idx, "segmento_suma"] = pd.qcut(
-        d.loc[valid_idx, "Suma_UMS"], 4, labels=["Q1 (más bajo)", "Q2", "Q3", "Q4 (más alto)"]
+        d.loc[valid_idx, "suma_usd"], 4, labels=["Q1 (más bajo)", "Q2", "Q3", "Q4 (más alto)"]
     ).astype(str)
 
     return d
@@ -203,13 +222,17 @@ def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     d["suma_valida"] = d["Suma_asegurada"] >= 0
 
+    # Monto en dólares (reemplaza a Suma_UMS y Suma_asegurada en toda la UI).
+    # 1 UMS = 228.700 ARS; 1 USD = 1.500 ARS.
+    d["suma_usd"] = d["Suma_UMS"] * 228700 / 1500
+
     d["age_decile"] = pd.qcut(d["Edad_ingreso"], 10, duplicates="drop")
     d["rango_edad"] = pd.cut(d["Edad_ingreso"], bins=AGE_BINS, labels=AGE_LABELS, right=False)
 
     d["segmento_suma"] = pd.Series(pd.NA, index=d.index, dtype="object")
     valid_idx = d.index[d["suma_valida"]]
     d.loc[valid_idx, "segmento_suma"] = pd.qcut(
-        d.loc[valid_idx, "Suma_UMS"], 4, labels=["Q1 (más bajo)", "Q2", "Q3", "Q4 (más alto)"]
+        d.loc[valid_idx, "suma_usd"], 4, labels=["Q1 (más bajo)", "Q2", "Q3", "Q4 (más alto)"]
     ).astype(str)
 
     return d
@@ -217,15 +240,18 @@ def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner="Procesando el archivo cargado...")
 def process_uploaded_file(file_bytes: bytes, file_name: str) -> pd.DataFrame:
-    """Lee y limpia un archivo subido manualmente (.csv o .xlsx).
+    """Lee y limpia un archivo subido manualmente (.csv, .xlsx o .parquet).
 
     Cachea por contenido del archivo (`file_bytes` como parte de la clave de
     cache) para no reprocesar si el usuario no cambió el archivo. Lanza
     `ValueError` si al archivo le faltan columnas esperadas del esquema
     original de la base de siniestros de vida.
     """
-    if file_name.lower().endswith(".csv"):
+    name_lower = file_name.lower()
+    if name_lower.endswith(".csv"):
         df = pd.read_csv(io.BytesIO(file_bytes))
+    elif name_lower.endswith(".parquet"):
+        df = pd.read_parquet(io.BytesIO(file_bytes))
     else:
         try:
             df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Hoja1")
@@ -239,10 +265,16 @@ def process_uploaded_file(file_bytes: bytes, file_name: str) -> pd.DataFrame:
             "Faltan las siguientes columnas: " + ", ".join(faltantes)
         )
 
-    # `_clean_dataframe` opera sobre `occurDate` como fecha (necesita restar
-    # fechas para recalcular la edad de los registros "(nulo)"). Un CSV no
-    # tiene tipos de columna propios como un .xlsx, así que lo normalizamos acá.
-    df["occurDate"] = pd.to_datetime(df["occurDate"], errors="coerce")
+    if name_lower.endswith(".csv"):
+        # `_clean_dataframe` opera sobre `occurDate` como fecha (necesita restar
+        # fechas para recalcular la edad de los registros "(nulo)"). Un CSV no
+        # tiene tipos de columna propios como un .xlsx, así que lo normalizamos acá.
+        df["occurDate"] = pd.to_datetime(df["occurDate"], errors="coerce")
+    elif name_lower.endswith(".parquet"):
+        # Mismo motivo que en `load_clean_data`: Parquet devuelve estas
+        # columnas con el dtype estricto "str" de pandas 3.
+        df["Edad"] = df["Edad"].astype(object)
+        df["Cliente Asegurado[Fecha Nacimiento]"] = df["Cliente Asegurado[Fecha Nacimiento]"].astype(object)
 
     return _clean_dataframe(df)
 
@@ -290,16 +322,20 @@ def compute_kpis(d: pd.DataFrame) -> dict:
     n_total = len(d)
     n_siniestros = int(d["is_siniestro"].sum())
     incidencia = n_siniestros / n_total * 100 if n_total else 0.0
-    monto_total_ums = d.loc[d["suma_valida"], "Suma_UMS"].sum()
+    monto_total_usd = d.loc[d["suma_valida"], "suma_usd"].sum()
     unidad_counts = d[UNIDAD_COL].value_counts()
     top3_pct = unidad_counts.head(3).sum() / unidad_counts.sum() * 100 if len(unidad_counts) else 0.0
-    demora_mediana = d["demora_den"].median()
+    edad_mediana_ingreso = d["Edad_ingreso"].median()
+    edad_p25_ingreso = d["Edad_ingreso"].quantile(0.25)
+    edad_p75_ingreso = d["Edad_ingreso"].quantile(0.75)
     return dict(
         n_total=n_total,
         incidencia=incidencia,
-        monto_total_ums=monto_total_ums,
+        monto_total_usd=monto_total_usd,
         top3_pct=top3_pct,
-        demora_mediana=demora_mediana,
+        edad_mediana_ingreso=edad_mediana_ingreso,
+        edad_p25_ingreso=edad_p25_ingreso,
+        edad_p75_ingreso=edad_p75_ingreso,
     )
 
 
@@ -313,17 +349,22 @@ def render_kpi_header(d: pd.DataFrame):
         "Incidencia global", f"{kpis['incidencia']:.2f}%",
         help="Incidencia de muerte global: siniestros sobre el total de asegurados de la cartera.",
     )
+    monto_fmt = f"{kpis['monto_total_usd']:,.2f}".replace(",", "@").replace(".", ",").replace("@", ".")
     c3.metric(
-        "Monto expuesto", f"{kpis['monto_total_ums']:,.0f} UMS".replace(",", "."),
-        help="Monto total expuesto en Suma Asegurada (UMS), sumando toda la cartera con signo válido.",
+        "Monto expuesto", f"USD {monto_fmt}",
+        help="Monto total expuesto en Suma Asegurada (USD), sumando toda la cartera con signo válido.",
     )
     c4.metric(
         "Top-3 unidades", f"{kpis['top3_pct']:.1f}%",
-        help="Concentración de cartera: % de asegurados en las 3 unidades de negocio más grandes.",
+        help="Concentración de cartera: % de asegurados en las 3 unidades de negocio con mayor cantidad de clientes.",
     )
     c5.metric(
-        "Demora de denuncia", f"{kpis['demora_mediana']:.0f} días",
-        help="Demora mediana de denuncia: días entre la ocurrencia del siniestro y su notificación.",
+        "Edad mediana de ingreso", f"{kpis['edad_mediana_ingreso']:.0f} años",
+        help=(
+            f"P25: {kpis['edad_p25_ingreso']:.0f} años — "
+            f"Mediana: {kpis['edad_mediana_ingreso']:.0f} años — "
+            f"P75: {kpis['edad_p75_ingreso']:.0f} años"
+        ),
     )
 
     st.caption(
@@ -379,18 +420,37 @@ def section_composicion(d: pd.DataFrame):
 
     st.subheader("Distribución de cartera por unidad de negocio")
     st.caption("Vista global de la cartera — no se ve afectada por los filtros")
-    orden = d[UNIDAD_COL].value_counts().sort_values(ascending=True)
-    fig = px.bar(
-        x=orden.values, y=orden.index, orientation="h",
-        labels={"x": "Cantidad de asegurados", "y": ""},
+    vista_unidad = st.radio(
+        "Mostrar distribución por:",
+        options=["Clientes", "Monto asegurado (USD)"],
+        horizontal=True,
+        key="radio_dist_unidad",
     )
-    fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
-    style_fig(fig, height=max(380, 28 * len(orden)), showlegend=False)
-    st.plotly_chart(fig, width='stretch')
-    st.caption(
-        "Tamaño relativo de cada unidad de negocio. La cartera está fuertemente "
-        "concentrada en pocas unidades (ver KPI de concentración top-3)."
-    )
+    if vista_unidad == "Clientes":
+        orden = d[UNIDAD_COL].value_counts().sort_values(ascending=True)
+        fig = px.bar(
+            x=orden.values, y=orden.index, orientation="h",
+            labels={"x": "Cantidad de asegurados", "y": ""},
+        )
+        fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
+        style_fig(fig, height=max(380, 28 * len(orden)), showlegend=False)
+        st.plotly_chart(fig, width='stretch')
+        st.caption(
+            "Tamaño relativo de cada unidad de negocio. La cartera está fuertemente "
+            "concentrada en pocas unidades (ver KPI de concentración top-3)."
+        )
+    else:
+        monto_unidad = (
+            d[d["suma_valida"]].groupby(UNIDAD_COL, observed=True)["suma_usd"].sum().sort_values(ascending=True)
+        )
+        fig = px.bar(
+            x=monto_unidad.values, y=monto_unidad.index, orientation="h",
+            labels={"x": "Capital asegurado (USD)", "y": ""},
+        )
+        fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
+        style_fig(fig, height=max(380, 28 * len(monto_unidad)), showlegend=False)
+        st.plotly_chart(fig, width='stretch')
+        st.caption("Capital total asegurado (en dólares) por unidad de negocio, sobre la cartera completa.")
 
     st.subheader("Distribución de edad de ingreso por sexo")
     fig = go.Figure()
@@ -444,32 +504,30 @@ def section_riesgo(d: pd.DataFrame):
         "pueden tener una proporción de siniestros mucho mayor que unidades grandes."
     )
 
-    st.subheader("Exposición, siniestralidad y demora de denuncia por unidad")
+    st.subheader("Exposición, siniestralidad y capital asegurado por unidad")
     st.caption("Vista de cartera total — no se ve afectada por los filtros")
     base_unidad = d.groupby(UNIDAD_COL, observed=True).agg(
         n_polizas=("Refcert", "count"), siniestros=("is_siniestro", "sum")
     )
-    demora_mediana_unidad = d[d["is_siniestro"] == 1].groupby(UNIDAD_COL, observed=True)["demora_den"].median()
-    monto_total_unidad = d[d["suma_valida"]].groupby(UNIDAD_COL, observed=True)["Suma_UMS"].sum()
-    base_unidad["demora_mediana"] = demora_mediana_unidad
-    base_unidad["monto_total_ums"] = monto_total_unidad
+    monto_total_unidad = d[d["suma_valida"]].groupby(UNIDAD_COL, observed=True)["suma_usd"].sum()
+    base_unidad["monto_total_usd"] = monto_total_unidad
     base_unidad["pct_siniestros"] = base_unidad["siniestros"] / base_unidad["n_polizas"] * 100
-    base_unidad = base_unidad.dropna(subset=["demora_mediana", "monto_total_ums"])
+    base_unidad = base_unidad.dropna(subset=["monto_total_usd"])
     if base_unidad.empty:
-        st.info("No hay datos suficientes de demora de denuncia por unidad.")
+        st.info("No hay datos suficientes por unidad.")
     else:
         fig = px.scatter(
             base_unidad.reset_index(), x="n_polizas", y="pct_siniestros",
-            size="demora_mediana", color="monto_total_ums", color_continuous_scale=BLUE_SEQUENTIAL,
+            size="monto_total_usd", color="monto_total_usd", color_continuous_scale=BLUE_SEQUENTIAL,
             text=UNIDAD_COL, size_max=55, log_x=True,
             labels={
-                "n_polizas": "N° de asegurados en la unidad (escala log)",
+                "n_polizas": "N° de asegurados (escala log)",
                 "pct_siniestros": "% de siniestros",
-                "demora_mediana": "Demora mediana de denuncia (días)",
-                "monto_total_ums": "Monto total asegurado (UMS)",
+                "monto_total_usd": "Capital asegurado (USD)",
             },
         )
         fig.update_traces(textposition="top center", marker_line_color="white", marker_line_width=0.6)
+        fig.update_layout(coloraxis_colorbar=dict(title="Capital asegurado (USD)"))
         fig.add_hline(y=incidencia_global_total, line_dash="dash", line_color=COLOR_REFERENCE,
                       annotation_text=f"incidencia global ({incidencia_global_total:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
         x_min = base_unidad["n_polizas"].min()
@@ -479,9 +537,9 @@ def section_riesgo(d: pd.DataFrame):
         fig.update_layout(margin=dict(l=10, r=40, t=60, b=10))
         st.plotly_chart(fig, width='stretch')
         st.caption(
-            "Cada burbuja es una unidad de negocio. Su posición muestra cuántos clientes tiene y qué "
-            "proporción siniestró. El color indica el capital total expuesto y el tamaño la demora "
-            "mediana de denuncia (a mayor burbuja, más días tarda la unidad en reportar un siniestro)."
+            "Cada burbuja es una unidad de negocio. Su posición muestra cuántos clientes tiene y qué proporción "
+            "siniestró. El tamaño y el color indican el capital total asegurado en dólares: burbujas más grandes "
+            "y más oscuras concentran mayor volumen de capital."
         )
 
     st.subheader("Incidencia de siniestros por segmento de Suma Asegurada")
@@ -495,21 +553,21 @@ def section_riesgo(d: pd.DataFrame):
     else:
         seg["pct_siniestros"] = seg["siniestros"] / seg["n_polizas"] * 100
 
-        # Límites reales de cada cuartil (min/max de Suma_UMS por grupo), calculados
+        # Límites reales de cada cuartil (min/max de suma_usd por grupo), calculados
         # sobre toda la cartera para que las etiquetas no cambien con los filtros.
-        def _fmt_ums(v):
+        def _fmt_usd(v):
             return f"{v:.1f}" if abs(v) < 10 else f"{v:,.0f}".replace(",", ".")
 
-        bounds = d.dropna(subset=["segmento_suma"]).groupby("segmento_suma", observed=True)["Suma_UMS"].agg(["min", "max"])
+        bounds = d.dropna(subset=["segmento_suma"]).groupby("segmento_suma", observed=True)["suma_usd"].agg(["min", "max"])
         bounds = bounds.reindex(orden_seg)
         q1_max = bounds.loc["Q1 (más bajo)", "max"]
         q2_max = bounds.loc["Q2", "max"]
         q3_max = bounds.loc["Q3", "max"]
         etiquetas = {
-            "Q1 (más bajo)": f"Q1 (0 – {_fmt_ums(q1_max)} UMS)",
-            "Q2": f"Q2 ({_fmt_ums(q1_max)} – {_fmt_ums(q2_max)} UMS)",
-            "Q3": f"Q3 ({_fmt_ums(q2_max)} – {_fmt_ums(q3_max)} UMS)",
-            "Q4 (más alto)": f"Q4 ({_fmt_ums(q3_max)}+ UMS)",
+            "Q1 (más bajo)": f"Q1 (0 – {_fmt_usd(q1_max)} USD)",
+            "Q2": f"Q2 ({_fmt_usd(q1_max)} – {_fmt_usd(q2_max)} USD)",
+            "Q3": f"Q3 ({_fmt_usd(q2_max)} – {_fmt_usd(q3_max)} USD)",
+            "Q4 (más alto)": f"Q4 ({_fmt_usd(q3_max)}+ USD)",
         }
         seg = seg.reset_index()
         seg["segmento_suma"] = seg["segmento_suma"].map(etiquetas)
@@ -522,7 +580,7 @@ def section_riesgo(d: pd.DataFrame):
         style_fig(fig, showlegend=False)
         st.plotly_chart(fig, width='stretch')
         st.caption(
-            "La suma asegurada se divide en cuatro grupos de igual tamaño (cuartiles). Q1 agrupa las "
+            "La suma asegurada (en dólares) se divide en cuatro grupos de igual tamaño (cuartiles). Q1 agrupa las "
             "pólizas de menor cobertura y Q4 las de mayor cobertura. Se muestra qué proporción de "
             "asegurados siniestró en cada grupo."
         )
@@ -551,11 +609,11 @@ def section_riesgo(d: pd.DataFrame):
         sin_datos()
     else:
         fig = px.box(
-            d_valid, x="Status", y="Suma_UMS", color="Status",
+            d_valid, x="Status", y="suma_usd", color="Status",
             category_orders={"Status": ["No Fallecido", "Fallecido"]},
             color_discrete_map={"No Fallecido": COLOR_PRIMARY, "Fallecido": COLOR_ACCENT},
             log_y=True,
-            labels={"Suma_UMS": "Suma Asegurada (UMS, escala log)", "Status": ""},
+            labels={"suma_usd": "Suma Asegurada (USD, escala log)", "Status": ""},
         )
         style_fig(fig, showlegend=False)
         st.plotly_chart(fig, width='stretch')
@@ -629,9 +687,9 @@ def section_etario(d: pd.DataFrame):
         if d_valid.empty:
             st.info("No hay registros con Suma Asegurada válida en la selección actual.")
         else:
-            by_edad_suma = d_valid.groupby("rango_edad", observed=True)["Suma_UMS"].mean().reindex(AGE_LABELS)
+            by_edad_suma = d_valid.groupby("rango_edad", observed=True)["suma_usd"].mean().reindex(AGE_LABELS)
             fig = px.bar(x=by_edad_suma.index, y=by_edad_suma.values,
-                         labels={"x": "Rango etario (edad de ingreso)", "y": "Suma Asegurada promedio (UMS)"})
+                         labels={"x": "Rango etario (edad de ingreso)", "y": "Suma Asegurada promedio (USD)"})
             fig.update_traces(marker_color=COLOR_ACCENT, marker_line_width=0)
             style_fig(fig, showlegend=False)
             st.plotly_chart(fig, width='stretch')
@@ -676,54 +734,6 @@ def section_temporal(d: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
-# Sección 5 — Demora de denuncia
-# ---------------------------------------------------------------------------
-def section_demora(d: pd.DataFrame):
-    st.header("5. Demora de denuncia")
-
-    st.markdown(
-        "La **demora de denuncia** es la cantidad de días entre la ocurrencia del siniestro y el momento "
-        "en que se notifica a la aseguradora. Es relevante operativamente porque una denuncia tardía "
-        "retrasa la constitución de reservas, la gestión del caso y, en algunas líneas, puede afectar la "
-        "cobertura contractual."
-    )
-
-    unidades_sel = unidad_filter(d, "s5")
-    dd = d[d[UNIDAD_COL].isin(unidades_sel) & (d["is_siniestro"] == 1)]
-    if dd.empty:
-        sin_datos()
-        return
-
-    mediana_global = dd["demora_den"].median()
-
-    resumen = dd.groupby(UNIDAD_COL, observed=True)["demora_den"].agg(
-        mediana="median", p25=lambda s: s.quantile(0.25), p75=lambda s: s.quantile(0.75), n="count"
-    ).sort_values("mediana", ascending=False)
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=resumen.index, y=resumen["mediana"],
-        marker_color=COLOR_PRIMARY,
-        error_y=dict(
-            type="data", symmetric=False,
-            array=resumen["p75"] - resumen["mediana"],
-            arrayminus=resumen["mediana"] - resumen["p25"],
-            color=COLOR_MUTED,
-        ),
-        name="Mediana de demora (días)",
-    ))
-    fig.add_hline(y=mediana_global, line_dash="dash", line_color=COLOR_REFERENCE,
-                  annotation_text=f"mediana general ({mediana_global:.0f} días)", annotation_font_color=COLOR_TEXT_SECONDARY)
-    fig.update_layout(xaxis_title="", yaxis_title="Demora de denuncia (días)")
-    style_fig(fig, height=460, showlegend=False)
-    st.plotly_chart(fig, width='stretch')
-    st.caption(
-        "Barras ordenadas de mayor a menor demora mediana; las líneas verticales muestran el rango "
-        "intercuartílico (P25–P75) de cada unidad. La línea punteada es la mediana general de la selección."
-    )
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def _render_navegacion(d: pd.DataFrame, fuente_caption: str):
@@ -735,7 +745,6 @@ def _render_navegacion(d: pd.DataFrame, fuente_caption: str):
             "2. Riesgo y siniestralidad",
             "3. Perfil etario y cobertura",
             "4. Análisis temporal",
-            "5. Demora de denuncia",
         ],
     )
     st.sidebar.divider()
@@ -749,8 +758,6 @@ def _render_navegacion(d: pd.DataFrame, fuente_caption: str):
         section_etario(d)
     elif seccion.startswith("4."):
         section_temporal(d)
-    elif seccion.startswith("5."):
-        section_demora(d)
 
 
 def main():
@@ -767,7 +774,7 @@ def main():
     _, col_centro, _ = st.columns([1, 2, 1])
     with col_centro:
         st.markdown("### Cargá el archivo de datos para iniciar el dashboard")
-        archivo = st.file_uploader("Archivo de datos", type=["csv", "xlsx"])
+        archivo = st.file_uploader("Archivo de datos", type=["csv", "xlsx", "parquet"])
         st.caption("El archivo debe contener las columnas originales de la base de siniestros de vida")
 
     if archivo is None:
