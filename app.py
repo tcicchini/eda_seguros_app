@@ -10,6 +10,7 @@ descartar) más los hallazgos nuevos generados en ese reporte.
 
 Esta app NO copia los datos crudos: los lee directamente desde la carpeta
 `datos/` del proyecto (ver resolución de `DATA_DIR` más abajo).
+
 """
 
 import io
