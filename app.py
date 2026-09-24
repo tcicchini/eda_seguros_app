@@ -174,6 +174,10 @@ def load_clean_data(data_file: str) -> pd.DataFrame:
         d.loc[valid_idx, "suma_usd"], 4, labels=["Q1 (más bajo)", "Q2", "Q3", "Q4 (más alto)"]
     ).astype(str)
 
+    for col in ["sexo", "Unidad de Negocio[Unidad Negocios]", "Status", "segmento_suma", "rango_edad"]:
+        if col in d.columns:
+            d[col] = d[col].astype("category")
+
     return d
 
 
@@ -235,6 +239,10 @@ def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     d.loc[valid_idx, "segmento_suma"] = pd.qcut(
         d.loc[valid_idx, "suma_usd"], 4, labels=["Q1 (más bajo)", "Q2", "Q3", "Q4 (más alto)"]
     ).astype(str)
+
+    for col in ["sexo", "Unidad de Negocio[Unidad Negocios]", "Status", "segmento_suma", "rango_edad"]:
+        if col in d.columns:
+            d[col] = d[col].astype("category")
 
     return d
 
@@ -340,6 +348,24 @@ def compute_kpis(d: pd.DataFrame) -> dict:
     )
 
 
+def fmt_usd(valor: float) -> str:
+    """Formatea un valor en USD de forma adaptativa según su magnitud.
+    Separador decimal: punto. Separador de miles: punto.
+    < 1.000          → 'USD X'
+    1.000–999.999    → 'USD X.Xk'
+    1M–999M          → 'USD X.X M'
+    >= 1.000M        → 'USD X.XXX M'
+    """
+    if abs(valor) < 1_000:
+        return f"USD {valor:,.0f}".replace(",", ".")
+    elif abs(valor) < 1_000_000:
+        return f"USD {valor/1_000:,.1f}k".replace(",", ".")
+    elif abs(valor) < 1_000_000_000:
+        return f"USD {valor/1_000_000:,.1f} M".replace(",", ".")
+    else:
+        return f"USD {valor/1_000_000:,.0f} M".replace(",", ".")
+
+
 def render_kpi_header(d: pd.DataFrame):
     st.title("Análisis de Cartera — Seguros de Vida")
     kpis = compute_kpis(d)
@@ -350,10 +376,10 @@ def render_kpi_header(d: pd.DataFrame):
         "Incidencia global", f"{kpis['incidencia']:.2f}%",
         help="Incidencia de muerte global: siniestros sobre el total de asegurados de la cartera.",
     )
-    monto_fmt = f"{kpis['monto_total_usd']:,.2f}".replace(",", "@").replace(".", ",").replace("@", ".")
     c3.metric(
-        "Monto expuesto", f"USD {monto_fmt}",
-        help="Monto total expuesto en Suma Asegurada (USD), sumando toda la cartera con signo válido.",
+        "Monto expuesto",
+        fmt_usd(kpis['monto_total_usd']),
+        help="Monto total expuesto en Suma Asegurada (USD). Formato adaptativo: k = miles, M = millones.",
     )
     c4.metric(
         "Top-3 unidades", f"{kpis['top3_pct']:.1f}%",
@@ -375,10 +401,49 @@ def render_kpi_header(d: pd.DataFrame):
     st.divider()
 
 
+@st.cache_data(show_spinner=False)
+def compute_aggregados_globales(df_hash: int, _d: pd.DataFrame) -> dict:
+    """Pre-computa todos los agregados que no dependen de filtros."""
+    incidencia_global = _d["is_siniestro"].sum() / len(_d) * 100
+
+    riesgo_unidad = _d.groupby(UNIDAD_COL, observed=True)["is_siniestro"].agg(["sum", "count"])
+    riesgo_unidad.columns = ["siniestros", "total_asegurados"]
+    riesgo_unidad["pct_siniestros"] = riesgo_unidad["siniestros"] / riesgo_unidad["total_asegurados"] * 100
+    riesgo_unidad = riesgo_unidad.sort_values("pct_siniestros", ascending=True)
+
+    monto_total_unidad = _d[_d["suma_valida"]].groupby(UNIDAD_COL, observed=True)["suma_usd"].sum()
+
+    base_unidad = _d.groupby(UNIDAD_COL, observed=True).agg(
+        n_polizas=("Refcert", "count"), siniestros=("is_siniestro", "sum")
+    )
+    base_unidad["monto_total_usd"] = monto_total_unidad
+    base_unidad["pct_siniestros"] = base_unidad["siniestros"] / base_unidad["n_polizas"] * 100
+    base_unidad = base_unidad.dropna(subset=["monto_total_usd"])
+
+    orden_unidad_clientes = _d[UNIDAD_COL].value_counts().sort_values(ascending=True)
+    orden_unidad_monto = _d[_d["suma_valida"]].groupby(
+        UNIDAD_COL, observed=True)["suma_usd"].sum().sort_values(ascending=True)
+
+    sexo_counts = _d["sexo"].value_counts()
+
+    bounds = _d.dropna(subset=["segmento_suma"]).groupby(
+        "segmento_suma", observed=True)["suma_usd"].agg(["min", "max"])
+
+    return dict(
+        incidencia_global=incidencia_global,
+        riesgo_unidad=riesgo_unidad,
+        base_unidad=base_unidad,
+        orden_unidad_clientes=orden_unidad_clientes,
+        orden_unidad_monto=orden_unidad_monto,
+        sexo_counts=sexo_counts,
+        bounds=bounds,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sección 1 — Composición de la cartera
 # ---------------------------------------------------------------------------
-def section_composicion(d: pd.DataFrame):
+def section_composicion(d: pd.DataFrame, agregados: dict):
     st.header("1. Composición de la cartera")
 
     fcol1, fcol2 = st.columns(2)
@@ -410,7 +475,7 @@ def section_composicion(d: pd.DataFrame):
     with col2:
         st.subheader("Composición por sexo")
         st.caption("Vista global de la cartera — no se ve afectada por los filtros")
-        sexo_counts = d["sexo"].value_counts()
+        sexo_counts = agregados["sexo_counts"]
         fig = px.pie(
             values=sexo_counts.values, names=sexo_counts.index, hole=0.45,
             color=sexo_counts.index, color_discrete_map=GENDER_COLOR_MAP,
@@ -428,7 +493,7 @@ def section_composicion(d: pd.DataFrame):
         key="radio_dist_unidad",
     )
     if vista_unidad == "Clientes":
-        orden = d[UNIDAD_COL].value_counts().sort_values(ascending=True)
+        orden = agregados["orden_unidad_clientes"]
         fig = px.bar(
             x=orden.values, y=orden.index, orientation="h",
             labels={"x": "Cantidad de asegurados", "y": ""},
@@ -441,17 +506,21 @@ def section_composicion(d: pd.DataFrame):
             "concentrada en pocas unidades (ver KPI de concentración top-3)."
         )
     else:
-        monto_unidad = (
-            d[d["suma_valida"]].groupby(UNIDAD_COL, observed=True)["suma_usd"].sum().sort_values(ascending=True)
-        )
+        monto_unidad = agregados["orden_unidad_monto"]
         fig = px.bar(
             x=monto_unidad.values, y=monto_unidad.index, orientation="h",
             labels={"x": "Capital asegurado (USD)", "y": ""},
         )
         fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
         style_fig(fig, height=max(380, 28 * len(monto_unidad)), showlegend=False)
+        x_max = monto_unidad.max()
+        magnitud = 10 ** int(np.floor(np.log10(x_max))) if x_max > 0 else 1
+        tick_step = magnitud / 2
+        tickvals = np.arange(0, x_max * 1.15, tick_step)
+        ticktext = [fmt_usd(v) for v in tickvals]
+        fig.update_xaxes(tickvals=tickvals, ticktext=ticktext)
         st.plotly_chart(fig, width='stretch')
-        st.caption("Capital total asegurado (en dólares) por unidad de negocio, sobre la cartera completa.")
+        st.caption("Capital total asegurado por unidad de negocio, sobre la cartera completa.")
 
     st.subheader("Distribución de edad de ingreso por sexo")
     fig = go.Figure()
@@ -472,7 +541,7 @@ def section_composicion(d: pd.DataFrame):
 # ---------------------------------------------------------------------------
 # Sección 2 — Riesgo y siniestralidad
 # ---------------------------------------------------------------------------
-def section_riesgo(d: pd.DataFrame):
+def section_riesgo(d: pd.DataFrame, agregados: dict):
     st.header("2. Riesgo y siniestralidad")
 
     unidades_sel = unidad_filter(d, "s2")
@@ -482,14 +551,11 @@ def section_riesgo(d: pd.DataFrame):
         return
 
     incidencia_global_filtrada = dd["is_siniestro"].sum() / len(dd) * 100
-    incidencia_global_total = d["is_siniestro"].sum() / len(d) * 100
+    incidencia_global_total = agregados["incidencia_global"]
 
     st.subheader("Incidencia de siniestros por unidad de negocio")
     st.caption("Vista de cartera total — no se ve afectada por los filtros")
-    riesgo_unidad = d.groupby(UNIDAD_COL, observed=True)["is_siniestro"].agg(["sum", "count"])
-    riesgo_unidad.columns = ["siniestros", "total_asegurados"]
-    riesgo_unidad["pct_siniestros"] = riesgo_unidad["siniestros"] / riesgo_unidad["total_asegurados"] * 100
-    riesgo_unidad = riesgo_unidad.sort_values("pct_siniestros", ascending=True)
+    riesgo_unidad = agregados["riesgo_unidad"]
     fig = px.bar(
         riesgo_unidad.reset_index(), x="pct_siniestros", y=UNIDAD_COL, orientation="h",
         color="total_asegurados", color_continuous_scale=BLUE_SEQUENTIAL,
@@ -507,13 +573,7 @@ def section_riesgo(d: pd.DataFrame):
 
     st.subheader("Exposición, siniestralidad y capital asegurado por unidad")
     st.caption("Vista de cartera total — no se ve afectada por los filtros")
-    base_unidad = d.groupby(UNIDAD_COL, observed=True).agg(
-        n_polizas=("Refcert", "count"), siniestros=("is_siniestro", "sum")
-    )
-    monto_total_unidad = d[d["suma_valida"]].groupby(UNIDAD_COL, observed=True)["suma_usd"].sum()
-    base_unidad["monto_total_usd"] = monto_total_unidad
-    base_unidad["pct_siniestros"] = base_unidad["siniestros"] / base_unidad["n_polizas"] * 100
-    base_unidad = base_unidad.dropna(subset=["monto_total_usd"])
+    base_unidad = agregados["base_unidad"]
     if base_unidad.empty:
         st.info("No hay datos suficientes por unidad.")
     else:
@@ -528,7 +588,12 @@ def section_riesgo(d: pd.DataFrame):
             },
         )
         fig.update_traces(textposition="top center", marker_line_color="white", marker_line_width=0.6)
-        fig.update_layout(coloraxis_colorbar=dict(title="Capital asegurado (USD)"))
+        cbar_max = base_unidad["monto_total_usd"].max()
+        cbar_magnitud = 10 ** int(np.floor(np.log10(cbar_max))) if cbar_max > 0 else 1
+        cbar_step = cbar_magnitud / 2
+        cbar_tickvals = np.arange(0, cbar_max * 1.05, cbar_step)
+        cbar_ticktext = [fmt_usd(v) for v in cbar_tickvals]
+        fig.update_layout(coloraxis_colorbar=dict(title="Capital (USD)", tickvals=cbar_tickvals, ticktext=cbar_ticktext))
         fig.add_hline(y=incidencia_global_total, line_dash="dash", line_color=COLOR_REFERENCE,
                       annotation_text=f"incidencia global ({incidencia_global_total:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
         x_min = base_unidad["n_polizas"].min()
@@ -554,21 +619,18 @@ def section_riesgo(d: pd.DataFrame):
     else:
         seg["pct_siniestros"] = seg["siniestros"] / seg["n_polizas"] * 100
 
-        # Límites reales de cada cuartil (min/max de suma_usd por grupo), calculados
-        # sobre toda la cartera para que las etiquetas no cambien con los filtros.
-        def _fmt_usd(v):
-            return f"{v:.1f}" if abs(v) < 10 else f"{v:,.0f}".replace(",", ".")
-
-        bounds = d.dropna(subset=["segmento_suma"]).groupby("segmento_suma", observed=True)["suma_usd"].agg(["min", "max"])
-        bounds = bounds.reindex(orden_seg)
+        # Límites reales de cada cuartil (min/max de suma_usd por grupo, en USD),
+        # pre-calculados sobre toda la cartera en compute_aggregados_globales
+        # para que las etiquetas no cambien con los filtros.
+        bounds = agregados["bounds"].reindex(orden_seg)
         q1_max = bounds.loc["Q1 (más bajo)", "max"]
         q2_max = bounds.loc["Q2", "max"]
         q3_max = bounds.loc["Q3", "max"]
         etiquetas = {
-            "Q1 (más bajo)": f"Q1 (0 – {_fmt_usd(q1_max)} USD)",
-            "Q2": f"Q2 ({_fmt_usd(q1_max)} – {_fmt_usd(q2_max)} USD)",
-            "Q3": f"Q3 ({_fmt_usd(q2_max)} – {_fmt_usd(q3_max)} USD)",
-            "Q4 (más alto)": f"Q4 ({_fmt_usd(q3_max)}+ USD)",
+            "Q1 (más bajo)": f"Q1 (0 – {fmt_usd(q1_max)})",
+            "Q2": f"Q2 ({fmt_usd(q1_max)} – {fmt_usd(q2_max)})",
+            "Q3": f"Q3 ({fmt_usd(q2_max)} – {fmt_usd(q3_max)})",
+            "Q4 (más alto)": f"Q4 ({fmt_usd(q3_max)}+)",
         }
         seg = seg.reset_index()
         seg["segmento_suma"] = seg["segmento_suma"].map(etiquetas)
@@ -581,8 +643,8 @@ def section_riesgo(d: pd.DataFrame):
         style_fig(fig, showlegend=False)
         st.plotly_chart(fig, width='stretch')
         st.caption(
-            "La suma asegurada (en dólares) se divide en cuatro grupos de igual tamaño (cuartiles). Q1 agrupa las "
-            "pólizas de menor cobertura y Q4 las de mayor cobertura. Se muestra qué proporción de "
+            "La suma asegurada se divide en cuatro grupos de igual tamaño (cuartiles). "
+            "Q1 agrupa las pólizas de menor cobertura y Q4 las de mayor cobertura. Se muestra qué proporción de "
             "asegurados siniestró en cada grupo."
         )
 
@@ -605,7 +667,7 @@ def section_riesgo(d: pd.DataFrame):
         )
 
     st.subheader("Suma asegurada por estatus (fallecido vs. no fallecido)")
-    d_valid = dd[dd["suma_valida"]]
+    d_valid = dd[dd["suma_valida"]].copy()
     if d_valid.empty:
         sin_datos()
     else:
@@ -617,24 +679,18 @@ def section_riesgo(d: pd.DataFrame):
             labels={"suma_usd": "Suma Asegurada (USD, escala log)", "Status": ""},
         )
         style_fig(fig, showlegend=False)
+        y_min = d_valid["suma_usd"].replace(0, np.nan).dropna().min()
+        y_max = d_valid["suma_usd"].max()
+        exp_min = int(np.floor(np.log10(y_min))) if y_min > 0 else 0
+        exp_max = int(np.ceil(np.log10(y_max))) if y_max > 0 else 6
+        tickvals = [10**e for e in range(exp_min, exp_max + 1)]
+        ticktext = [fmt_usd(v) for v in tickvals]
+        fig.update_yaxes(tickvals=tickvals, ticktext=ticktext)
         st.plotly_chart(fig, width='stretch')
         st.caption(
             "Se usa escala logarítmica porque la Suma Asegurada tiene valores extremos que aplastarían "
             "la comparación en escala lineal. Permite ver si los siniestros ocurren en pólizas de mayor o menor cobertura."
         )
-
-    st.subheader("Edad de ingreso por estatus (fallecido vs. no fallecido)")
-    fig = px.box(
-        dd, x="Status", y="Edad_ingreso", color="Status",
-        category_orders={"Status": ["No Fallecido", "Fallecido"]},
-        color_discrete_map={"No Fallecido": COLOR_PRIMARY, "Fallecido": COLOR_ACCENT},
-        labels={"Edad_ingreso": "Edad de ingreso", "Status": ""},
-    )
-    style_fig(fig, showlegend=False)
-    st.plotly_chart(fig, width='stretch')
-    st.caption(
-        "Los asegurados que siniestran ingresaron a edades significativamente mayores que quienes no siniestran."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -688,49 +744,38 @@ def section_etario(d: pd.DataFrame):
         if d_valid.empty:
             st.info("No hay registros con Suma Asegurada válida en la selección actual.")
         else:
-            by_edad_suma = d_valid.groupby("rango_edad", observed=True)["suma_usd"].mean().reindex(AGE_LABELS)
+            by_edad_suma = (
+                d_valid.groupby("rango_edad", observed=True)["suma_usd"].mean().reindex(AGE_LABELS)
+            )
             fig = px.bar(x=by_edad_suma.index, y=by_edad_suma.values,
                          labels={"x": "Rango etario (edad de ingreso)", "y": "Suma Asegurada promedio (USD)"})
             fig.update_traces(marker_color=COLOR_ACCENT, marker_line_width=0)
             style_fig(fig, showlegend=False)
+            y_vals = by_edad_suma.dropna().values
+            if len(y_vals):
+                y_max = y_vals.max()
+                magnitud = 10 ** int(np.floor(np.log10(y_max))) if y_max > 0 else 1
+                tick_step = magnitud / 2
+                tickvals = np.arange(0, y_max * 1.15, tick_step)
+                ticktext = [fmt_usd(v) for v in tickvals]
+                fig.update_yaxes(tickvals=tickvals, ticktext=ticktext)
             st.plotly_chart(fig, width='stretch')
             st.caption(
                 "Muestra si los asegurados de distintas edades contratan, en promedio, coberturas de "
                 "distinto tamaño."
             )
 
-
-# ---------------------------------------------------------------------------
-# Sección 4 — Análisis temporal
-# ---------------------------------------------------------------------------
-def section_temporal(d: pd.DataFrame):
-    st.header("4. Análisis temporal de altas de póliza")
-
-    col = "Poliza/Certificado[Fecha Origen Certificado]"
-    fechas = pd.to_datetime(d[col])
-    pct_dia1 = (fechas.dt.day == 1).mean() * 100
-
-    monthly = fechas.dt.to_period("M").value_counts().sort_index()
-    monthly.index = monthly.index.to_timestamp()
-
-    top_fecha = fechas.value_counts().idxmax()
-    top_fecha_n = fechas.value_counts().max()
-    top_fecha_pct = top_fecha_n / len(fechas) * 100
-
-    fig = px.bar(x=monthly.index, y=monthly.values,
-                 labels={"x": "Mes de alta de póliza", "y": "Cantidad de altas (escala log)"}, log_y=True)
-    fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
+    st.subheader("Edad de ingreso por estatus (fallecido vs. no fallecido)")
+    fig = px.box(
+        dd, x="Status", y="Edad_ingreso", color="Status",
+        category_orders={"Status": ["No Fallecido", "Fallecido"]},
+        color_discrete_map={"No Fallecido": COLOR_PRIMARY, "Fallecido": COLOR_ACCENT},
+        labels={"Edad_ingreso": "Edad de ingreso", "Status": ""},
+    )
     style_fig(fig, showlegend=False)
     st.plotly_chart(fig, width='stretch')
-
-    st.warning(
-        f"**No se observa una estacionalidad de negocio interpretable.** El {pct_dia1:.0f}% de los "
-        f"registros tiene como fecha de alta el día 1 de un mes, y una sola fecha "
-        f"(**{pd.Timestamp(top_fecha).strftime('%Y-%m-%d')}**) concentra el {top_fecha_pct:.1f}% de toda "
-        "la cartera. Este patrón es típico de **cargas masivas de datos** (migraciones de sistema, "
-        "incorporación de carteras completas) y no de altas comerciales día a día. "
-        "**Recomendación:** no usar esta variable para conclusiones de estacionalidad de ventas sin antes "
-        "depurarla junto con el área de sistemas/negocio para distinguir altas reales de cargas por lote."
+    st.caption(
+        "Los asegurados que siniestran ingresaron a edades significativamente mayores que quienes no siniestran."
     )
 
 
@@ -745,20 +790,19 @@ def _render_navegacion(d: pd.DataFrame, fuente_caption: str):
             "1. Composición de la cartera",
             "2. Riesgo y siniestralidad",
             "3. Perfil etario y cobertura",
-            "4. Análisis temporal",
         ],
     )
     st.sidebar.divider()
     st.sidebar.caption(fuente_caption)
 
     if seccion.startswith("1."):
-        section_composicion(d)
+        agregados = compute_aggregados_globales(df_hash=len(d), _d=d)
+        section_composicion(d, agregados)
     elif seccion.startswith("2."):
-        section_riesgo(d)
+        agregados = compute_aggregados_globales(df_hash=len(d), _d=d)
+        section_riesgo(d, agregados)
     elif seccion.startswith("3."):
         section_etario(d)
-    elif seccion.startswith("4."):
-        section_temporal(d)
 
 
 def main():
@@ -787,10 +831,11 @@ def main():
         st.error(str(e))
         st.stop()
 
-    st.success(f"Se cargaron {len(d):,} registros.".replace(",", "."))
-
     render_kpi_header(d)
-    _render_navegacion(d, "Datos cargados manualmente:\n\n" f"`{archivo.name}`")
+    _render_navegacion(
+        d,
+        f"Datos cargados manualmente:\n\n`{archivo.name}`\n\n{len(d):,} registros.".replace(",", "."),
+    )
 
 
 if __name__ == "__main__":
