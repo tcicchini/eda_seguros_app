@@ -815,12 +815,14 @@ def main():
 
     # 2) El archivo no existe en el path local -> pantalla de carga manual,
     # mostrando únicamente el uploader (sin contenido del dashboard).
-    st.title("Análisis de Cartera — Seguros de Vida")
-    _, col_centro, _ = st.columns([1, 2, 1])
-    with col_centro:
-        st.markdown("### Cargá el archivo de datos para iniciar el dashboard")
-        archivo = st.file_uploader("Archivo de datos", type=["csv", "xlsx", "parquet"])
-        st.caption("El archivo debe contener las columnas originales de la base de siniestros de vida")
+    upload_container = st.empty()
+    with upload_container.container():
+        st.title("Análisis de Cartera — Seguros de Vida")
+        _, col_centro, _ = st.columns([1, 2, 1])
+        with col_centro:
+            st.markdown("### Cargá el archivo de datos para iniciar el dashboard")
+            archivo = st.file_uploader("Archivo de datos", type=["csv", "xlsx", "parquet"])
+            st.caption("El archivo debe contener las columnas originales de la base de siniestros de vida")
 
     if archivo is None:
         st.stop()
@@ -830,6 +832,8 @@ def main():
     except ValueError as e:
         st.error(str(e))
         st.stop()
+
+    upload_container.empty()
 
     render_kpi_header(d)
     _render_navegacion(
