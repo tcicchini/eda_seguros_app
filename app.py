@@ -33,6 +33,11 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
+# Constantes del estudio
+# ---------------------------------------------------------------------------
+PERIODO_AÑOS = 3  # Años de observación del estudio
+
+# ---------------------------------------------------------------------------
 # Paleta de colores (consistente en toda la app)
 # ---------------------------------------------------------------------------
 # Paleta categórica validada para accesibilidad (contraste y daltonismo):
@@ -305,21 +310,6 @@ def hist_binned(serie: pd.Series, bins: int = 60):
 UNIDAD_COL = "Unidad de Negocio[Unidad Negocios]"
 
 
-def unidad_filter(d: pd.DataFrame, key: str):
-    unidades = sorted(d[UNIDAD_COL].dropna().unique().tolist())
-    seleccion = st.multiselect(
-        "Unidad de negocio", options=unidades, default=unidades, key=f"unidad_{key}"
-    )
-    return seleccion
-
-
-def genero_filter(key: str):
-    seleccion = st.multiselect(
-        "Género", options=["F", "M"], default=["F", "M"], key=f"genero_{key}"
-    )
-    return seleccion
-
-
 def sin_datos():
     st.warning("No hay datos para la selección actual")
 
@@ -330,7 +320,7 @@ def sin_datos():
 def compute_kpis(d: pd.DataFrame) -> dict:
     n_total = len(d)
     n_siniestros = int(d["is_siniestro"].sum())
-    incidencia = n_siniestros / n_total * 100 if n_total else 0.0
+    incidencia = n_siniestros / n_total * 100 / PERIODO_AÑOS if n_total else 0.0
     monto_total_usd = d.loc[d["suma_valida"], "suma_usd"].sum()
     unidad_counts = d[UNIDAD_COL].value_counts()
     top3_pct = unidad_counts.head(3).sum() / unidad_counts.sum() * 100 if len(unidad_counts) else 0.0
@@ -350,20 +340,20 @@ def compute_kpis(d: pd.DataFrame) -> dict:
 
 def fmt_usd(valor: float) -> str:
     """Formatea un valor en USD de forma adaptativa según su magnitud.
-    Separador decimal: punto. Separador de miles: punto.
-    < 1.000          → 'USD X'
-    1.000–999.999    → 'USD X.Xk'
-    1M–999M          → 'USD X.X M'
-    >= 1.000M        → 'USD X.XXX M'
+    Formato anglosajón: coma separador de miles, punto separador decimal.
+    < 1,000            → 'USD X'
+    1,000–999,999      → 'USD X.Xk'
+    1M–999M            → 'USD X.X M'
+    >= 1,000M          → 'USD X,XXX M'
     """
     if abs(valor) < 1_000:
-        return f"USD {valor:,.0f}".replace(",", ".")
+        return f"USD {valor:,.0f}"
     elif abs(valor) < 1_000_000:
-        return f"USD {valor/1_000:,.1f}k".replace(",", ".")
+        return f"USD {valor/1_000:.1f}k"
     elif abs(valor) < 1_000_000_000:
-        return f"USD {valor/1_000_000:,.1f} M".replace(",", ".")
+        return f"USD {valor/1_000_000:.1f} M"
     else:
-        return f"USD {valor/1_000_000:,.0f} M".replace(",", ".")
+        return f"USD {valor/1_000_000:,.0f} M"
 
 
 def render_kpi_header(d: pd.DataFrame):
@@ -371,15 +361,22 @@ def render_kpi_header(d: pd.DataFrame):
     kpis = compute_kpis(d)
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total de asegurados", f"{kpis['n_total']:,.0f}".replace(",", "."))
+    c1.metric("Total de asegurados", f"{kpis['n_total']:,.0f}")
     c2.metric(
-        "Incidencia global", f"{kpis['incidencia']:.2f}%",
-        help="Incidencia de muerte global: siniestros sobre el total de asegurados de la cartera.",
+        "Incidencia global (anual)", f"{kpis['incidencia']:.2f}%",
+        help=(
+            "Tasa de mortalidad anualizada: siniestros sobre total de asegurados, "
+            "dividido por el período de observación de 3 años."
+        ),
     )
     c3.metric(
         "Monto expuesto",
         fmt_usd(kpis['monto_total_usd']),
-        help="Monto total expuesto en Suma Asegurada (USD). Formato adaptativo: k = miles, M = millones.",
+        help=(
+            "Monto total expuesto en Suma Asegurada (USD). Se usa coma como separador "
+            "de miles y punto como separador decimal (formato internacional). "
+            "Formato abreviado: k = miles, M = millones."
+        ),
     )
     c4.metric(
         "Top-3 unidades", f"{kpis['top3_pct']:.1f}%",
@@ -404,11 +401,11 @@ def render_kpi_header(d: pd.DataFrame):
 @st.cache_data(show_spinner=False)
 def compute_aggregados_globales(df_hash: int, _d: pd.DataFrame) -> dict:
     """Pre-computa todos los agregados que no dependen de filtros."""
-    incidencia_global = _d["is_siniestro"].sum() / len(_d) * 100
+    incidencia_global = _d["is_siniestro"].sum() / len(_d) * 100 / PERIODO_AÑOS
 
     riesgo_unidad = _d.groupby(UNIDAD_COL, observed=True)["is_siniestro"].agg(["sum", "count"])
     riesgo_unidad.columns = ["siniestros", "total_asegurados"]
-    riesgo_unidad["pct_siniestros"] = riesgo_unidad["siniestros"] / riesgo_unidad["total_asegurados"] * 100
+    riesgo_unidad["pct_siniestros"] = riesgo_unidad["siniestros"] / riesgo_unidad["total_asegurados"] * 100 / PERIODO_AÑOS
     riesgo_unidad = riesgo_unidad.sort_values("pct_siniestros", ascending=True)
 
     monto_total_unidad = _d[_d["suma_valida"]].groupby(UNIDAD_COL, observed=True)["suma_usd"].sum()
@@ -417,7 +414,7 @@ def compute_aggregados_globales(df_hash: int, _d: pd.DataFrame) -> dict:
         n_polizas=("Refcert", "count"), siniestros=("is_siniestro", "sum")
     )
     base_unidad["monto_total_usd"] = monto_total_unidad
-    base_unidad["pct_siniestros"] = base_unidad["siniestros"] / base_unidad["n_polizas"] * 100
+    base_unidad["pct_siniestros"] = base_unidad["siniestros"] / base_unidad["n_polizas"] * 100 / PERIODO_AÑOS
     base_unidad = base_unidad.dropna(subset=["monto_total_usd"])
 
     orden_unidad_clientes = _d[UNIDAD_COL].value_counts().sort_values(ascending=True)
@@ -441,32 +438,145 @@ def compute_aggregados_globales(df_hash: int, _d: pd.DataFrame) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Figuras globales cacheadas (no dependen de los filtros de sección; reciben
+# solo series/escalares livianos —no el dataframe completo— para que el hash
+# de caché sea barato).
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def _fig_donut_sexo(sexo_counts: pd.Series) -> go.Figure:
+    fig = px.pie(
+        values=sexo_counts.values, names=sexo_counts.index, hole=0.45,
+        color=sexo_counts.index, color_discrete_map=GENDER_COLOR_MAP,
+    )
+    style_fig(fig, height=420)
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def _fig_distribucion_unidad_clientes(orden: pd.Series) -> go.Figure:
+    fig = px.bar(
+        x=orden.values, y=orden.index, orientation="h",
+        labels={"x": "Cantidad de asegurados", "y": ""},
+    )
+    fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
+    style_fig(fig, height=max(380, 28 * len(orden)), showlegend=False)
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def _fig_distribucion_unidad_monto(monto_unidad: pd.Series) -> go.Figure:
+    fig = px.bar(
+        x=monto_unidad.values, y=monto_unidad.index, orientation="h",
+        labels={"x": "Capital asegurado (USD)", "y": ""},
+    )
+    fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
+    style_fig(fig, height=max(380, 28 * len(monto_unidad)), showlegend=False)
+    x_max = monto_unidad.max()
+    magnitud = 10 ** int(np.floor(np.log10(x_max))) if x_max > 0 else 1
+    tick_step = magnitud / 2
+    tickvals = np.arange(0, x_max * 1.15, tick_step)
+    ticktext = [fmt_usd(v) for v in tickvals]
+    fig.update_xaxes(tickvals=tickvals, ticktext=ticktext)
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def _fig_incidencia_unidad(pct_siniestros: pd.Series, total_asegurados: pd.Series,
+                            incidencia_global_total: float) -> go.Figure:
+    datos = pd.DataFrame({
+        UNIDAD_COL: pct_siniestros.index,
+        "pct_siniestros": pct_siniestros.values,
+        "total_asegurados": total_asegurados.reindex(pct_siniestros.index).values,
+    })
+    fig = px.bar(
+        datos, x="pct_siniestros", y=UNIDAD_COL, orientation="h",
+        color="total_asegurados", color_continuous_scale=BLUE_SEQUENTIAL,
+        labels={"pct_siniestros": "% de siniestros", UNIDAD_COL: "", "total_asegurados": "Total asegurados"},
+    )
+    fig.add_vline(x=incidencia_global_total, line_dash="dash", line_color=COLOR_REFERENCE,
+                  annotation_text=f"Incidencia global (anual) ({incidencia_global_total:.2f}%)",
+                  annotation_font_color=COLOR_TEXT_SECONDARY, annotation_position="bottom")
+    style_fig(fig, height=max(380, 28 * len(pct_siniestros)), showlegend=False)
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def _fig_burbujas_unidad(n_polizas: pd.Series, pct_siniestros: pd.Series, monto_total_usd: pd.Series,
+                          incidencia_global_total: float) -> go.Figure:
+    datos = pd.DataFrame({
+        UNIDAD_COL: n_polizas.index,
+        "n_polizas": n_polizas.values,
+        "pct_siniestros": pct_siniestros.reindex(n_polizas.index).values,
+        "monto_total_usd": monto_total_usd.reindex(n_polizas.index).values,
+    })
+    fig = px.scatter(
+        datos, x="n_polizas", y="pct_siniestros",
+        size="monto_total_usd", color="monto_total_usd", color_continuous_scale=BLUE_SEQUENTIAL,
+        text=UNIDAD_COL, size_max=55, log_x=True,
+        labels={
+            "n_polizas": "N° de asegurados (escala log)",
+            "pct_siniestros": "% de siniestros",
+            "monto_total_usd": "Capital asegurado (USD)",
+        },
+    )
+    fig.update_traces(textposition="top center", marker_line_color="white", marker_line_width=0.6)
+    cbar_max = monto_total_usd.max()
+    cbar_magnitud = 10 ** int(np.floor(np.log10(cbar_max))) if cbar_max > 0 else 1
+    cbar_step = cbar_magnitud / 2
+    cbar_tickvals = np.arange(0, cbar_max * 1.05, cbar_step)
+    cbar_ticktext = [fmt_usd(v) for v in cbar_tickvals]
+    fig.update_layout(coloraxis_colorbar=dict(title="Capital (USD)", tickvals=cbar_tickvals, ticktext=cbar_ticktext))
+    fig.add_hline(y=incidencia_global_total, line_dash="dash", line_color=COLOR_REFERENCE,
+                  annotation_text=f"incidencia global (anual) ({incidencia_global_total:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
+    x_min = n_polizas.min()
+    x_max = n_polizas.max()
+    fig.update_xaxes(range=[np.log10(x_min) - 0.35, np.log10(x_max) + 0.55])
+    style_fig(fig, height=520, showlegend=False)
+    fig.update_layout(margin=dict(l=10, r=40, t=60, b=10))
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Sección 1 — Composición de la cartera
 # ---------------------------------------------------------------------------
-def section_composicion(d: pd.DataFrame, agregados: dict):
+def section_composicion(d: pd.DataFrame, agregados: dict, unidades_sel: list, generos_sel: list, rangos_sel: list):
     st.header("1. Composición de la cartera")
 
-    fcol1, fcol2 = st.columns(2)
-    with fcol1:
-        unidades_sel = unidad_filter(d, "s1")
-    with fcol2:
-        generos_sel = genero_filter("s1")
-
-    dd = d[d[UNIDAD_COL].isin(unidades_sel) & d["sexo"].isin(generos_sel)]
+    dd = d[
+        d[UNIDAD_COL].isin(unidades_sel)
+        & d["sexo"].isin(generos_sel)
+        & d["rango_edad"].isin(rangos_sel)
+    ]
     if dd.empty:
         sin_datos()
         return
+
+    # Bins compartidos de 5 años (mismo criterio que antes vía xbins=dict(size=5))
+    # para los histogramas de edad de esta sección.
+    edad_valida = dd["Edad_ingreso"].dropna()
+    if edad_valida.empty:
+        edges_edad = np.array([0, 5])
+    else:
+        edad_min, edad_max = edad_valida.min(), edad_valida.max()
+        edges_edad = np.arange(np.floor(edad_min / 5) * 5, np.ceil(edad_max / 5) * 5 + 5, 5)
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("Distribución de edad de ingreso")
-        fig = go.Figure()
-        fig.add_trace(go.Histogram(x=dd["Edad_ingreso"], xbins=dict(size=5), marker_color=COLOR_PRIMARY))
+        centers, counts = hist_binned(dd["Edad_ingreso"], bins=edges_edad)
+        fig = px.bar(x=centers, y=counts, labels={"x": "Edad de ingreso", "y": "Cantidad de asegurados"})
+        fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
         style_fig(fig, showlegend=False)
-        fig.update_xaxes(title="Edad de ingreso")
-        fig.update_yaxes(title="Cantidad de asegurados")
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True,
+            config={
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": [
+                    "toImage", "select2d", "lasso2d",
+                    "toggleSpikelines", "hoverCompareCartesian"
+                ],
+                "responsive": True
+            })
         st.caption(
             "Muestra en qué edades se concentra el ingreso a la cartera (bins de 5 años). "
             "La mayoría de los asegurados ingresa entre los 30 y los 55 años."
@@ -475,13 +585,16 @@ def section_composicion(d: pd.DataFrame, agregados: dict):
     with col2:
         st.subheader("Composición por sexo")
         st.caption("Vista global de la cartera — no se ve afectada por los filtros")
-        sexo_counts = agregados["sexo_counts"]
-        fig = px.pie(
-            values=sexo_counts.values, names=sexo_counts.index, hole=0.45,
-            color=sexo_counts.index, color_discrete_map=GENDER_COLOR_MAP,
-        )
-        style_fig(fig, height=420)
-        st.plotly_chart(fig, width='stretch')
+        fig = _fig_donut_sexo(agregados["sexo_counts"])
+        st.plotly_chart(fig, use_container_width=True,
+            config={
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": [
+                    "toImage", "select2d", "lasso2d",
+                    "toggleSpikelines", "hoverCompareCartesian"
+                ],
+                "responsive": True
+            })
         st.caption("Proporción de hombres y mujeres en el total de la cartera.")
 
     st.subheader("Distribución de cartera por unidad de negocio")
@@ -493,33 +606,31 @@ def section_composicion(d: pd.DataFrame, agregados: dict):
         key="radio_dist_unidad",
     )
     if vista_unidad == "Clientes":
-        orden = agregados["orden_unidad_clientes"]
-        fig = px.bar(
-            x=orden.values, y=orden.index, orientation="h",
-            labels={"x": "Cantidad de asegurados", "y": ""},
-        )
-        fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
-        style_fig(fig, height=max(380, 28 * len(orden)), showlegend=False)
-        st.plotly_chart(fig, width='stretch')
+        fig = _fig_distribucion_unidad_clientes(agregados["orden_unidad_clientes"])
+        st.plotly_chart(fig, use_container_width=True,
+            config={
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": [
+                    "toImage", "select2d", "lasso2d",
+                    "toggleSpikelines", "hoverCompareCartesian"
+                ],
+                "responsive": True
+            })
         st.caption(
             "Tamaño relativo de cada unidad de negocio. La cartera está fuertemente "
             "concentrada en pocas unidades (ver KPI de concentración top-3)."
         )
     else:
-        monto_unidad = agregados["orden_unidad_monto"]
-        fig = px.bar(
-            x=monto_unidad.values, y=monto_unidad.index, orientation="h",
-            labels={"x": "Capital asegurado (USD)", "y": ""},
-        )
-        fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
-        style_fig(fig, height=max(380, 28 * len(monto_unidad)), showlegend=False)
-        x_max = monto_unidad.max()
-        magnitud = 10 ** int(np.floor(np.log10(x_max))) if x_max > 0 else 1
-        tick_step = magnitud / 2
-        tickvals = np.arange(0, x_max * 1.15, tick_step)
-        ticktext = [fmt_usd(v) for v in tickvals]
-        fig.update_xaxes(tickvals=tickvals, ticktext=ticktext)
-        st.plotly_chart(fig, width='stretch')
+        fig = _fig_distribucion_unidad_monto(agregados["orden_unidad_monto"])
+        st.plotly_chart(fig, use_container_width=True,
+            config={
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": [
+                    "toImage", "select2d", "lasso2d",
+                    "toggleSpikelines", "hoverCompareCartesian"
+                ],
+                "responsive": True
+            })
         st.caption("Capital total asegurado por unidad de negocio, sobre la cartera completa.")
 
     st.subheader("Distribución de edad de ingreso por sexo")
@@ -528,44 +639,104 @@ def section_composicion(d: pd.DataFrame, agregados: dict):
         sub = dd.loc[dd["sexo"] == genero, "Edad_ingreso"]
         if sub.empty:
             continue
-        fig.add_trace(go.Histogram(x=sub, xbins=dict(size=5), name=genero, marker_color=GENDER_COLOR_MAP[genero], opacity=0.75))
+        centers, counts = hist_binned(sub, bins=edges_edad)
+        fig.add_trace(go.Bar(x=centers, y=counts, name=genero, marker_color=GENDER_COLOR_MAP[genero], opacity=0.75))
     fig.update_layout(barmode="overlay")
     style_fig(fig)
     fig.update_xaxes(title="Edad de ingreso")
     fig.update_yaxes(title="Cantidad de asegurados")
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, use_container_width=True,
+        config={
+            "displayModeBar": True,
+            "modeBarButtonsToRemove": [
+                "toImage", "select2d", "lasso2d",
+                "toggleSpikelines", "hoverCompareCartesian"
+            ],
+            "responsive": True
+        })
     st.caption("Compara la forma de la distribución etaria entre hombres y mujeres en la selección actual (bins de 5 años).")
     st.caption("La distribución etaria es similar entre hombres y mujeres, sin diferencias relevantes entre géneros.")
+
+    st.subheader("Distribución de suma asegurada por póliza")
+    serie = dd[dd["suma_valida"]]["suma_usd"].dropna()
+    serie = serie[serie > 0]
+    if serie.empty:
+        sin_datos()
+    else:
+        p1 = serie.quantile(0.01)
+        serie_filtrada = serie[serie >= p1]
+        n_excluidos = len(serie) - len(serie_filtrada)
+
+        log_min = np.floor(np.log10(serie_filtrada.min()))
+        log_max = np.ceil(np.log10(serie_filtrada.max()))
+        edges = np.logspace(log_min, log_max, num=51)
+        counts, edges_out = np.histogram(serie_filtrada, bins=edges)
+        centers = np.sqrt(edges_out[:-1] * edges_out[1:])
+        tickvals = [10**e for e in range(int(log_min), int(log_max) + 1)]
+        ticktext = [fmt_usd(v) for v in tickvals]
+
+        log_widths = np.log10(edges_out[1:]) - np.log10(edges_out[:-1])
+        bar_widths = log_widths * centers * np.log(10)
+
+        fig = go.Figure(go.Bar(
+            x=centers,
+            y=counts,
+            width=bar_widths,
+            marker_color=COLOR_PRIMARY,
+            marker_line_width=0,
+            hovertemplate="Suma asegurada: %{x:,.0f} USD<br>Cantidad de pólizas: %{y:,.0f}<extra></extra>",
+        ))
+        fig.update_xaxes(type="log", tickvals=tickvals, ticktext=ticktext,
+                         title="Suma asegurada (USD)")
+        fig.update_yaxes(title="Cantidad de pólizas")
+        style_fig(fig, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True,
+                        config={
+                            "displayModeBar": True,
+                            "modeBarButtonsToRemove": [
+                                "toImage", "select2d", "lasso2d",
+                                "toggleSpikelines", "hoverCompareCartesian"
+                            ],
+                            "responsive": True
+                        })
+        st.caption(
+            f"Distribución de las sumas aseguradas individuales en la selección actual "
+            f"(eje X en escala logarítmica). Se excluyeron {n_excluidos:,} pólizas "
+            f"correspondientes al percentil más bajo de suma asegurada "
+            f"(por debajo de {fmt_usd(p1)}), consideradas valores atípicos o simbólicos. "
+            f"Permite identificar si la cartera se concentra en pólizas de bajo o alto capital."
+        )
 
 
 # ---------------------------------------------------------------------------
 # Sección 2 — Riesgo y siniestralidad
 # ---------------------------------------------------------------------------
-def section_riesgo(d: pd.DataFrame, agregados: dict):
+def section_riesgo(d: pd.DataFrame, agregados: dict, unidades_sel: list):
     st.header("2. Riesgo y siniestralidad")
 
-    unidades_sel = unidad_filter(d, "s2")
     dd = d[d[UNIDAD_COL].isin(unidades_sel)]
     if dd.empty:
         sin_datos()
         return
 
-    incidencia_global_filtrada = dd["is_siniestro"].sum() / len(dd) * 100
+    incidencia_global_filtrada = dd["is_siniestro"].sum() / len(dd) * 100 / PERIODO_AÑOS
     incidencia_global_total = agregados["incidencia_global"]
 
     st.subheader("Incidencia de siniestros por unidad de negocio")
     st.caption("Vista de cartera total — no se ve afectada por los filtros")
     riesgo_unidad = agregados["riesgo_unidad"]
-    fig = px.bar(
-        riesgo_unidad.reset_index(), x="pct_siniestros", y=UNIDAD_COL, orientation="h",
-        color="total_asegurados", color_continuous_scale=BLUE_SEQUENTIAL,
-        labels={"pct_siniestros": "% de siniestros", UNIDAD_COL: "", "total_asegurados": "Total asegurados"},
+    fig = _fig_incidencia_unidad(
+        riesgo_unidad["pct_siniestros"], riesgo_unidad["total_asegurados"], incidencia_global_total
     )
-    fig.add_vline(x=incidencia_global_total, line_dash="dash", line_color=COLOR_REFERENCE,
-                  annotation_text=f"Incidencia global ({incidencia_global_total:.2f}%)",
-                  annotation_font_color=COLOR_TEXT_SECONDARY, annotation_position="bottom")
-    style_fig(fig, height=max(380, 28 * len(riesgo_unidad)), showlegend=False)
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, use_container_width=True,
+        config={
+            "displayModeBar": True,
+            "modeBarButtonsToRemove": [
+                "toImage", "select2d", "lasso2d",
+                "toggleSpikelines", "hoverCompareCartesian"
+            ],
+            "responsive": True
+        })
     st.caption(
         "El volumen de siniestros y el riesgo relativo cuentan historias distintas: unidades chicas "
         "pueden tener una proporción de siniestros mucho mayor que unidades grandes."
@@ -577,31 +748,19 @@ def section_riesgo(d: pd.DataFrame, agregados: dict):
     if base_unidad.empty:
         st.info("No hay datos suficientes por unidad.")
     else:
-        fig = px.scatter(
-            base_unidad.reset_index(), x="n_polizas", y="pct_siniestros",
-            size="monto_total_usd", color="monto_total_usd", color_continuous_scale=BLUE_SEQUENTIAL,
-            text=UNIDAD_COL, size_max=55, log_x=True,
-            labels={
-                "n_polizas": "N° de asegurados (escala log)",
-                "pct_siniestros": "% de siniestros",
-                "monto_total_usd": "Capital asegurado (USD)",
-            },
+        fig = _fig_burbujas_unidad(
+            base_unidad["n_polizas"], base_unidad["pct_siniestros"], base_unidad["monto_total_usd"],
+            incidencia_global_total,
         )
-        fig.update_traces(textposition="top center", marker_line_color="white", marker_line_width=0.6)
-        cbar_max = base_unidad["monto_total_usd"].max()
-        cbar_magnitud = 10 ** int(np.floor(np.log10(cbar_max))) if cbar_max > 0 else 1
-        cbar_step = cbar_magnitud / 2
-        cbar_tickvals = np.arange(0, cbar_max * 1.05, cbar_step)
-        cbar_ticktext = [fmt_usd(v) for v in cbar_tickvals]
-        fig.update_layout(coloraxis_colorbar=dict(title="Capital (USD)", tickvals=cbar_tickvals, ticktext=cbar_ticktext))
-        fig.add_hline(y=incidencia_global_total, line_dash="dash", line_color=COLOR_REFERENCE,
-                      annotation_text=f"incidencia global ({incidencia_global_total:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
-        x_min = base_unidad["n_polizas"].min()
-        x_max = base_unidad["n_polizas"].max()
-        fig.update_xaxes(range=[np.log10(x_min) - 0.35, np.log10(x_max) + 0.55])
-        style_fig(fig, height=520, showlegend=False)
-        fig.update_layout(margin=dict(l=10, r=40, t=60, b=10))
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True,
+            config={
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": [
+                    "toImage", "select2d", "lasso2d",
+                    "toggleSpikelines", "hoverCompareCartesian"
+                ],
+                "responsive": True
+            })
         st.caption(
             "Cada burbuja es una unidad de negocio. Su posición muestra cuántos clientes tiene y qué proporción "
             "siniestró. El tamaño y el color indican el capital total asegurado en dólares: burbujas más grandes "
@@ -617,7 +776,7 @@ def section_riesgo(d: pd.DataFrame, agregados: dict):
     if seg.empty:
         st.info("No hay registros con Suma Asegurada válida en la selección actual.")
     else:
-        seg["pct_siniestros"] = seg["siniestros"] / seg["n_polizas"] * 100
+        seg["pct_siniestros"] = seg["siniestros"] / seg["n_polizas"] * 100 / PERIODO_AÑOS
 
         # Límites reales de cada cuartil (min/max de suma_usd por grupo, en USD),
         # pre-calculados sobre toda la cartera en compute_aggregados_globales
@@ -639,9 +798,17 @@ def section_riesgo(d: pd.DataFrame, agregados: dict):
                      labels={"segmento_suma": "Segmento por Suma Asegurada", "pct_siniestros": "% de siniestros"})
         fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
         fig.add_hline(y=incidencia_global_filtrada, line_dash="dash", line_color=COLOR_REFERENCE,
-                      annotation_text=f"incidencia de la selección ({incidencia_global_filtrada:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
+                      annotation_text=f"incidencia de la selección (anual) ({incidencia_global_filtrada:.2f}%)", annotation_font_color=COLOR_TEXT_SECONDARY)
         style_fig(fig, showlegend=False)
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True,
+            config={
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": [
+                    "toImage", "select2d", "lasso2d",
+                    "toggleSpikelines", "hoverCompareCartesian"
+                ],
+                "responsive": True
+            })
         st.caption(
             "La suma asegurada se divide en cuatro grupos de igual tamaño (cuartiles). "
             "Q1 agrupa las pólizas de menor cobertura y Q4 las de mayor cobertura. Se muestra qué proporción de "
@@ -650,6 +817,7 @@ def section_riesgo(d: pd.DataFrame, agregados: dict):
 
     st.subheader("Días hasta el siniestro")
     siniestros_dd = dd[dd["is_siniestro"] == 1]
+    siniestros_dd = siniestros_dd[siniestros_dd["dias_hasta_sin"] >= 0]
     if siniestros_dd.empty:
         sin_datos()
     else:
@@ -658,12 +826,21 @@ def section_riesgo(d: pd.DataFrame, agregados: dict):
         fig = px.bar(x=centers, y=counts, labels={"x": "Días hasta el siniestro", "y": "Cantidad de siniestros"})
         fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
         fig.add_vline(x=mediana_dias, line_dash="dash", line_color=COLOR_REFERENCE,
-                      annotation_text=f"Mediana: {mediana_dias:.0f} días", annotation_font_color=COLOR_TEXT_SECONDARY)
+                      annotation_text=f"Mediana: {mediana_dias:,.0f} días", annotation_font_color=COLOR_TEXT_SECONDARY)
         style_fig(fig, showlegend=False)
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True,
+            config={
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": [
+                    "toImage", "select2d", "lasso2d",
+                    "toggleSpikelines", "hoverCompareCartesian"
+                ],
+                "responsive": True
+            })
         st.caption(
             "Indica en qué etapa de la vida de la póliza ocurren los siniestros. La mayor concentración "
-            "sucede dentro de los primeros años de vigencia."
+            "sucede dentro de los primeros años de vigencia. Se excluyen registros con días negativos "
+            "(siniestros fechados antes del inicio de vigencia, considerados errores de carga)."
         )
 
     st.subheader("Suma asegurada por estatus (fallecido vs. no fallecido)")
@@ -686,7 +863,15 @@ def section_riesgo(d: pd.DataFrame, agregados: dict):
         tickvals = [10**e for e in range(exp_min, exp_max + 1)]
         ticktext = [fmt_usd(v) for v in tickvals]
         fig.update_yaxes(tickvals=tickvals, ticktext=ticktext)
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True,
+            config={
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": [
+                    "toImage", "select2d", "lasso2d",
+                    "toggleSpikelines", "hoverCompareCartesian"
+                ],
+                "responsive": True
+            })
         st.caption(
             "Se usa escala logarítmica porque la Suma Asegurada tiene valores extremos que aplastarían "
             "la comparación en escala lineal. Permite ver si los siniestros ocurren en pólizas de mayor o menor cobertura."
@@ -696,22 +881,16 @@ def section_riesgo(d: pd.DataFrame, agregados: dict):
 # ---------------------------------------------------------------------------
 # Sección 3 — Perfil etario y cobertura
 # ---------------------------------------------------------------------------
-def section_etario(d: pd.DataFrame):
+def section_etario(d: pd.DataFrame, unidades_sel: list, generos_sel: list):
     st.header("3. Perfil etario y cobertura")
-
-    fcol1, fcol2 = st.columns(2)
-    with fcol1:
-        generos_sel = genero_filter("s3")
-    with fcol2:
-        unidades_sel = unidad_filter(d, "s3")
 
     dd = d[d["sexo"].isin(generos_sel) & d[UNIDAD_COL].isin(unidades_sel)]
     if dd.empty:
         sin_datos()
         return
 
-    incidencia_seleccion = dd["is_siniestro"].sum() / len(dd) * 100
-    incidencia_global_total = d["is_siniestro"].sum() / len(d) * 100
+    incidencia_seleccion = dd["is_siniestro"].sum() / len(dd) * 100 / PERIODO_AÑOS
+    incidencia_global_total = d["is_siniestro"].sum() / len(d) * 100 / PERIODO_AÑOS
 
     col1, col2 = st.columns(2)
 
@@ -720,22 +899,30 @@ def section_etario(d: pd.DataFrame):
         by_edad = dd.dropna(subset=["rango_edad"]).groupby("rango_edad", observed=True).agg(
             n=("is_siniestro", "count"), eventos=("is_siniestro", "sum")
         ).reindex(AGE_LABELS)
-        by_edad["incidencia"] = by_edad["eventos"] / by_edad["n"] * 100
+        by_edad["incidencia"] = by_edad["eventos"] / by_edad["n"] * 100 / PERIODO_AÑOS
         fig = px.bar(by_edad.reset_index(), x="rango_edad", y="incidencia",
                      labels={"rango_edad": "Rango etario (edad de ingreso)", "incidencia": "% de siniestros"})
         fig.update_traces(marker_color=COLOR_PRIMARY, marker_line_width=0)
         fig.add_hline(y=incidencia_seleccion, line_dash="dash", line_color=COLOR_REFERENCE,
-                      annotation_text=f"Incidencia de la selección ({incidencia_seleccion:.2f}%)",
+                      annotation_text=f"Incidencia de la selección (anual) ({incidencia_seleccion:.2f}%)",
                       annotation_font_color=COLOR_TEXT_SECONDARY, annotation_position="top left")
         fig.add_hline(y=incidencia_global_total, line_dash="dot", line_color=COLOR_ACCENT,
-                      annotation_text=f"Incidencia global (cartera completa) ({incidencia_global_total:.2f}%)",
+                      annotation_text=f"Incidencia global (cartera completa, anual) ({incidencia_global_total:.2f}%)",
                       annotation_font_color=COLOR_TEXT_SECONDARY, annotation_position="bottom left")
         style_fig(fig, showlegend=False)
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True,
+            config={
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": [
+                    "toImage", "select2d", "lasso2d",
+                    "toggleSpikelines", "hoverCompareCartesian"
+                ],
+                "responsive": True
+            })
         st.caption(
             "El riesgo crece con la edad de ingreso, pero de forma no lineal: el salto más marcado "
-            "ocurre a partir de los 50 años. La línea punteada muestra la incidencia de la selección actual; "
-            "la línea de puntos, la incidencia global fija de toda la cartera."
+            "ocurre a partir de los 50 años. La línea punteada muestra la incidencia (anual) de la selección actual; "
+            "la línea de puntos, la incidencia global (anual) fija de toda la cartera."
         )
 
     with col2:
@@ -759,7 +946,15 @@ def section_etario(d: pd.DataFrame):
                 tickvals = np.arange(0, y_max * 1.15, tick_step)
                 ticktext = [fmt_usd(v) for v in tickvals]
                 fig.update_yaxes(tickvals=tickvals, ticktext=ticktext)
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True,
+                config={
+                    "displayModeBar": True,
+                    "modeBarButtonsToRemove": [
+                        "toImage", "select2d", "lasso2d",
+                        "toggleSpikelines", "hoverCompareCartesian"
+                    ],
+                    "responsive": True
+                })
             st.caption(
                 "Muestra si los asegurados de distintas edades contratan, en promedio, coberturas de "
                 "distinto tamaño."
@@ -773,7 +968,15 @@ def section_etario(d: pd.DataFrame):
         labels={"Edad_ingreso": "Edad de ingreso", "Status": ""},
     )
     style_fig(fig, showlegend=False)
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, use_container_width=True,
+        config={
+            "displayModeBar": True,
+            "modeBarButtonsToRemove": [
+                "toImage", "select2d", "lasso2d",
+                "toggleSpikelines", "hoverCompareCartesian"
+            ],
+            "responsive": True
+        })
     st.caption(
         "Los asegurados que siniestran ingresaron a edades significativamente mayores que quienes no siniestran."
     )
@@ -793,28 +996,65 @@ def _render_navegacion(d: pd.DataFrame, fuente_caption: str):
         ],
     )
     st.sidebar.divider()
+
+    # Filtros condicionales según la sección activa.
+    unidades_todas = sorted(d[UNIDAD_COL].dropna().unique().tolist())
+
+    if seccion.startswith("1."):
+        unidades_sel = st.sidebar.multiselect(
+            "Unidad de negocio", options=unidades_todas, default=unidades_todas, key="filtro_unidad_s1"
+        )
+        generos_sel = st.sidebar.multiselect(
+            "Género", options=["F", "M"], default=["F", "M"], key="filtro_genero_s1"
+        )
+        rangos_sel = st.sidebar.multiselect(
+            "Rango etario", options=AGE_LABELS, default=AGE_LABELS, key="filtro_rango_s1"
+        )
+    elif seccion.startswith("2."):
+        unidades_sel = st.sidebar.multiselect(
+            "Unidad de negocio", options=unidades_todas, default=unidades_todas, key="filtro_unidad_s2"
+        )
+    elif seccion.startswith("3."):
+        unidades_sel = st.sidebar.multiselect(
+            "Unidad de negocio", options=unidades_todas, default=unidades_todas, key="filtro_unidad_s3"
+        )
+        generos_sel = st.sidebar.multiselect(
+            "Género", options=["F", "M"], default=["F", "M"], key="filtro_genero_s3"
+        )
+
+    st.sidebar.divider()
     st.sidebar.caption(fuente_caption)
 
     if seccion.startswith("1."):
         agregados = compute_aggregados_globales(df_hash=len(d), _d=d)
-        section_composicion(d, agregados)
+        section_composicion(d, agregados, unidades_sel, generos_sel, rangos_sel)
     elif seccion.startswith("2."):
         agregados = compute_aggregados_globales(df_hash=len(d), _d=d)
-        section_riesgo(d, agregados)
+        section_riesgo(d, agregados, unidades_sel)
     elif seccion.startswith("3."):
-        section_etario(d)
+        section_etario(d, unidades_sel, generos_sel)
 
 
 def main():
+    if "df" not in st.session_state:
+        st.session_state["df"] = None
+    if "fuente" not in st.session_state:
+        st.session_state["fuente"] = None
+
     # 1) Intentar cargar automáticamente desde el path local ya definido.
-    if DATA_FILE.exists():
-        d = load_clean_data(str(DATA_FILE))
-        render_kpi_header(d)
-        _render_navegacion(d, "Datos leídos desde:\n\n" f"`{DATA_DIR}`")
+    if st.session_state["df"] is None and DATA_FILE.exists():
+        st.session_state["df"] = load_clean_data(str(DATA_FILE))
+        st.session_state["fuente"] = "Datos leídos desde:\n\n" f"`{DATA_DIR}`"
+
+    # 2) Si ya hay datos en session_state (cargados automáticamente o subidos
+    # manualmente en una interacción previa), renderizar directamente.
+    if st.session_state["df"] is not None:
+        render_kpi_header(st.session_state["df"])
+        _render_navegacion(st.session_state["df"], st.session_state["fuente"])
         return
 
-    # 2) El archivo no existe en el path local -> pantalla de carga manual,
-    # mostrando únicamente el uploader (sin contenido del dashboard).
+    # 3) No hay datos disponibles -> pantalla de carga manual, mostrando
+    # únicamente el uploader (sin contenido del dashboard).
     upload_container = st.empty()
     with upload_container.container():
         st.title("Análisis de Cartera — Seguros de Vida")
@@ -833,13 +1073,14 @@ def main():
         st.error(str(e))
         st.stop()
 
+    st.session_state["df"] = d
+    st.session_state["fuente"] = (
+        f"Datos cargados manualmente:\n\n`{archivo.name}`\n\n{len(d):,} registros."
+    )
     upload_container.empty()
 
-    render_kpi_header(d)
-    _render_navegacion(
-        d,
-        f"Datos cargados manualmente:\n\n`{archivo.name}`\n\n{len(d):,} registros.".replace(",", "."),
-    )
+    render_kpi_header(st.session_state["df"])
+    _render_navegacion(st.session_state["df"], st.session_state["fuente"])
 
 
 if __name__ == "__main__":
